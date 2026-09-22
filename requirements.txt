@@ -1,0 +1,7 @@
+sounddevice==0.4.7
+soundfile==0.12.1
+numpy==1.26.4
+librosa==0.10.2.post1
+SQLAlchemy==2.0.35
+python-dotenv==1.0.1
+cryptography==43.0.3

@@ -1,0 +1,21 @@
+# Entorno virtual
+.venv/
+venv/
+
+# Datos locales generados por la app (audios, embeddings y base de datos)
+data/
+
+# Variables de entorno y secretos — NUNCA se suben (PIN, clave de encriptación)
+.env
+*.key
+*.pem
+
+# Cache de Python
+__pycache__/
+*.pyc
+
+# Configuración de VS Code (opcional, puedes quitar esta línea si quieres versionarla)
+.vscode/
+
+# Archivos de sistema
+.DS_Store
