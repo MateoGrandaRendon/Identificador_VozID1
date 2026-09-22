@@ -29,38 +29,67 @@ import security
 
 
 # ---------------------------------------------------------------------------
-# Captura de UNA muestra con texto guiado + validación + reintento quirúrgico
+# Duración de grabación adaptada a la longitud del texto a leer
+# ---------------------------------------------------------------------------
+def _duracion_para_texto(texto: str) -> int:
+    """
+    Calcula una duración de grabación generosa, adaptada a la longitud del
+    texto (entre config.REGISTRO_DURACION_MIN y ..._MAX segundos), para
+    que el usuario nunca se sienta apurado leyendo la frase completa.
+    """
+    num_palabras = len(texto.split())
+    estimado = num_palabras / config.PALABRAS_POR_SEGUNDO_LECTURA + config.MARGEN_LECTURA_SEG
+    return int(max(config.REGISTRO_DURACION_MIN, min(config.REGISTRO_DURACION_MAX, round(estimado))))
+
+
+# ---------------------------------------------------------------------------
+# Captura de UNA muestra con texto guiado + cuenta regresiva + barra en vivo
+# + validación (calidad/SNR) + reproducción de verificación + reintento
 # ---------------------------------------------------------------------------
 def _capturar_muestra_valida(nombre: str, paso: int, total_pasos: int, texto_lectura: str):
     """
-    Graba UNA muestra (un "paso" del registro/re-entrenamiento guiado),
-    mostrando el texto que la persona debe leer, y valida su calidad antes
-    de aceptarla.
+    Graba UNA muestra (un "paso" del registro/re-entrenamiento guiado):
+    muestra el texto a leer, cuenta regresiva 3-2-1, graba con la barra de
+    tono+volumen en vivo (reutilizando grabar_audio_con_analisis), valida
+    su calidad (silencio/saturación/SNR) y ofrece escucharla antes de
+    confirmarla.
 
-    Manejo de errores QUIRÚRGICO: si la muestra se rechaza (silencio,
-    saturación/ruido excesivo), se ofrece reintentar EN ESTE MISMO PASO —
+    Manejo de errores QUIRÚRGICO: si la muestra se rechaza o el usuario no
+    queda conforme al escucharla, se ofrece reintentar EN ESTE MISMO PASO —
     nunca se reinician los pasos ya completados ni se vuelve al menú.
 
     Devuelve (ruta_audio, embedding), o None si el usuario decide cancelar
-    el reintento (en cuyo caso las muestras de pasos anteriores, ya
-    guardadas en la BD, se conservan tal cual).
+    el reintento (las muestras de pasos anteriores, ya guardadas, se
+    conservan tal cual).
     """
+    duracion = _duracion_para_texto(texto_lectura)
+
     while True:
         print(f"\n--- Paso {paso}/{total_pasos} ---")
-        print(f"📖 Lee en voz alta el siguiente texto mientras se graba:\n   \"{texto_lectura}\"")
-        input("\nPresiona ENTER y comienza a leer...")
-        audio = ap.grabar_audio()
+        print(f"📖 Lee en voz alta el siguiente texto (tendrás {duracion}s, sin prisa):\n   \"{texto_lectura}\"")
+        input("\nPresiona ENTER cuando estés listo...")
+        ap.cuenta_regresiva()
+        audio, _, _, _ = ap.grabar_audio_con_analisis(duracion=duracion, guardar_audio=True)
 
         es_valida, motivo = ap.validar_calidad_muestra(audio)
-        if es_valida:
-            ruta_audio = ap.guardar_wav(audio, nombre_base=nombre)
-            embedding = ap.extraer_embedding(audio)
-            return ruta_audio, embedding
+        if not es_valida:
+            print(f"⚠️  Muestra rechazada: {motivo}")
+            reintentar = input("¿Repetir este paso ahora mismo? (s/n): ").strip().lower()
+            if reintentar != "s":
+                return None
+            continue
 
-        print(f"⚠️  Muestra rechazada: {motivo}")
-        reintentar = input("¿Repetir este paso ahora mismo? (s/n): ").strip().lower()
-        if reintentar != "s":
-            return None
+        escuchar = input("¿Escuchar la grabación para verificarla? (s/n): ").strip().lower()
+        if escuchar == "s":
+            ap.reproducir_audio(audio)
+
+        conservar = input("¿Conservar esta muestra? (s/n): ").strip().lower()
+        if conservar != "s":
+            continue  # vuelve a grabar el mismo paso, sin afectar los anteriores
+
+        ruta_audio = ap.guardar_wav(audio, nombre_base=nombre)
+        embedding = ap.extraer_embedding(audio)
+        return ruta_audio, embedding
 
 
 # ---------------------------------------------------------------------------
@@ -111,22 +140,47 @@ def identificar_persona() -> None:
         return
 
     texto = random.choice(config.TEXTOS_LECTURA_VERIFICACION)
-    print(f"\n📖 Lee en voz alta el siguiente texto (distinto al usado en el registro):\n   \"{texto}\"")
-    input("\nPresiona ENTER y comienza a leer...")
-    audio = ap.grabar_audio()
+    duracion = _duracion_para_texto(texto)
+    print(f"\n📖 Lee en voz alta el siguiente texto (distinto al usado en el registro; tendrás {duracion}s):")
+    print(f"   \"{texto}\"")
+    input("\nPresiona ENTER cuando estés listo...")
+    ap.cuenta_regresiva()
+    audio, _, _, _ = ap.grabar_audio_con_analisis(duracion=duracion, guardar_audio=True)
+
+    es_valida, motivo = ap.validar_calidad_muestra(audio)
+    if not es_valida:
+        print(f"⚠️  No se pudo analizar la grabación: {motivo}")
+        print("No se reconoce ninguna voz registrada")
+        return
+
     embedding_nuevo = ap.extraer_embedding(audio)
 
-    mejor_nombre = None
-    mejor_score = -1.0
+    # --- Motor de comparación ESTRICTO: coseno Y euclidiana deben coincidir ---
+    mejor_nombre, mejor_similitud, mejor_distancia = None, -1.0, float("inf")
     for nombre, embedding in perfiles:
-        score = ap.similitud_coseno(embedding_nuevo, embedding)
-        if score > mejor_score:
-            mejor_score = score
-            mejor_nombre = nombre
+        similitud = ap.similitud_coseno(embedding_nuevo, embedding)
+        distancia = ap.distancia_euclidiana(embedding_nuevo, embedding)
+        # Se elige el candidato con mayor similitud coseno (métrica principal);
+        # la distancia euclidiana de ESE candidato se evalúa después como
+        # segundo criterio obligatorio, no como desempate.
+        if similitud > mejor_similitud:
+            mejor_similitud, mejor_distancia, mejor_nombre = similitud, distancia, nombre
 
-    print(f"\nResultado -> similitud más alta: {mejor_score:.3f} con '{mejor_nombre}'")
-    if mejor_score >= config.UMBRAL_SIMILITUD:
-        print(f"🟢 IDENTIFICADO como: {mejor_nombre} (confianza {mejor_score:.1%})")
+    print(f"\nMejor candidato: '{mejor_nombre}'  |  similitud coseno: {mejor_similitud:.4f}  |  distancia euclidiana: {mejor_distancia:.4f}")
+
+    coincide_coseno = mejor_similitud >= config.UMBRAL_SIMILITUD
+    coincide_euclidiana = mejor_distancia <= config.UMBRAL_DISTANCIA_EUCLIDIANA
+
+    if coincide_coseno and coincide_euclidiana:
+        print(f"🟢 IDENTIFICADO como: {mejor_nombre} (confianza {mejor_similitud:.1%})")
+
+        vivacidad = ap.calcular_puntaje_vivacidad(audio)
+        if vivacidad < config.VIVACIDAD_UMBRAL:
+            print(
+                f"⚠️  Aviso informativo: puntaje de vivacidad bajo ({vivacidad:.2f}). "
+                "Esta es solo una heurística ligera, no una prueba de que el audio sea "
+                "una grabación reproducida — no se bloquea el acceso, pero si tienes dudas, verifica en persona."
+            )
     else:
         print("No se reconoce ninguna voz registrada")
 

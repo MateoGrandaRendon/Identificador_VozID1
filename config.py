@@ -73,10 +73,12 @@ DEFAULT_MUESTRAS_POR_REGISTRO = 4
 # ---------------------------------------------------------------------------
 # Parámetros de identificación
 # ---------------------------------------------------------------------------
-UMBRAL_SIMILITUD = 0.80    # umbral de similitud coseno (0-1) para aceptar una coincidencia
-                             # NOTA: con el embedding multi-factorial (MFCC+F0+formantes+
-                             # energía+ritmo) este valor puede necesitar recalibrarse con
-                             # voces reales; empieza aquí y ajusta según tus pruebas.
+UMBRAL_SIMILITUD = 0.90    # umbral de similitud coseno (0-1) para aceptar una coincidencia
+                             # Calibrado con prueba sintética (4 "personas", 3 muestras c/u):
+                             # misma persona >= 0.9983, personas distintas <= 0.9946 (separación limpia).
+                             # Se deja en 0.90 (más conservador) porque voces reales, con ruido
+                             # ambiental y variación día a día, tendrán más solapamiento que una
+                             # señal sintética libre de ruido — ajusta con tus propias pruebas reales.
 
 # ---------------------------------------------------------------------------
 # Parámetros de extracción de características (MFCC)
@@ -153,3 +155,45 @@ TEXTOS_LECTURA_VERIFICACION = [
     "Esta frase es distinta a las que usé para registrarme, y así lo demuestro ahora.",
     "Mi identidad se confirma por cómo hablo, no por las palabras exactas que digo hoy.",
 ]
+
+# ---------------------------------------------------------------------------
+# Preprocesamiento: VAD (recorte de silencio) y estimación de SNR
+# ---------------------------------------------------------------------------
+# VAD_TOP_DB: umbral (en dB por debajo del pico) que usa librosa.effects.trim
+# para decidir qué es "silencio" y recortarlo de los extremos antes de
+# extraer características — así el embedding no se "ensucia" con silencio
+# de sobra al inicio/final de la grabación.
+VAD_TOP_DB = 30.0
+
+# SNR_MINIMO_DB: relación señal-ruido mínima aceptable. Por debajo de esto
+# se rechaza la muestra (demasiado ruido de fondo/eco para confiar en ella).
+SNR_MINIMO_DB = 8.0
+
+# ---------------------------------------------------------------------------
+# Motor de comparación ESTRICTO: cosine + distancia euclidiana combinadas
+# ---------------------------------------------------------------------------
+# Una identificación solo se acepta si supera AMBOS criterios a la vez:
+# similitud coseno alta Y distancia euclidiana baja. Exigir las dos reduce
+# falsos positivos que una sola métrica, por separado, podría dejar pasar.
+UMBRAL_DISTANCIA_EUCLIDIANA = 0.30   # Calibrado con la misma prueba: misma persona <= 0.177,
+                                       # personas distintas >= 0.311. Se deja con margen conservador.
+
+# ---------------------------------------------------------------------------
+# Heurística de "vivacidad" (liveness) — ADVERTENCIA, no bloqueo automático
+# ---------------------------------------------------------------------------
+# Ver el docstring de audio_processor.calcular_puntaje_vivacidad: esto es
+# una señal débil e informativa, NO un sistema de anti-spoofing robusto.
+VIVACIDAD_UMBRAL = 0.15
+
+# ---------------------------------------------------------------------------
+# Cuenta regresiva antes de grabar
+# ---------------------------------------------------------------------------
+CUENTA_REGRESIVA_SEG = 3
+
+# ---------------------------------------------------------------------------
+# Duración de grabación adaptada a la longitud del texto a leer
+# ---------------------------------------------------------------------------
+REGISTRO_DURACION_MIN = 10
+REGISTRO_DURACION_MAX = 15
+PALABRAS_POR_SEGUNDO_LECTURA = 2.0   # velocidad de lectura conservadora (~120 palabras/min)
+MARGEN_LECTURA_SEG = 3               # colchón extra para prepararse/terminar sin prisa

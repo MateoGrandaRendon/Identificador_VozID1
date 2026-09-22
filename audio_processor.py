@@ -2,28 +2,19 @@
 audio_processor.py
 -------------------
 Responsable de todo lo relacionado con el audio:
- 1) Capturar audio en tiempo real desde el micrófono (sounddevice).
- 2) Guardarlo como archivo .wav (soundfile).
- 3) Extraer un "embedding" (vector numérico que representa la voz).
+ 1) Capturar audio en tiempo real desde el micrófono (sounddevice), con
+    cuenta regresiva y barra de intensidad/modulación en vivo.
+ 2) Guardarlo como archivo .wav (soundfile), encriptado.
+ 3) Extraer un "embedding" (vector numérico multi-factorial que representa
+    la voz): MFCC + Delta + Delta-Delta, F0, formantes (LPC), energía
+    espectral, contraste espectral, ZCR y patrones temporales/ritmo.
  4) Comparar embeddings mediante similitud coseno.
-
-Nota sobre el embedding usado en esta Fase 1:
-    Se calculan los MFCC (Mel-Frequency Cepstral Coefficients) del audio y se
-    obtiene la media y desviación estándar de cada coeficiente a lo largo del
-    tiempo. Este vector es una "huella" simple pero efectiva de las
-    características de una voz, no requiere descargar modelos de deep
-    learning pesados y permite validar el flujo completo end-to-end
-    (grabar -> guardar -> comparar) rápidamente.
-
-    En una fase posterior, esta función se puede reemplazar por un modelo de
-    embeddings pre-entrenado (por ejemplo, resemblyzer o SpeechBrain
-    ECAPA-TDNN) sin tener que tocar main.py ni database.py: basta con
-    modificar `extraer_embedding` manteniendo la misma firma (entra audio,
-    sale un vector numpy).
+ 5) Reproducir audio ya capturado, para que el usuario pueda verificarlo.
 """
 
 import datetime
 import io
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -120,15 +111,45 @@ def _normalizar_bloque(vector: np.ndarray) -> np.ndarray:
     return vector / norma if norma > 0 else vector
 
 
-def validar_calidad_muestra(audio: np.ndarray) -> tuple:
+def _estimar_snr_db(audio: np.ndarray, samplerate: int) -> float:
+    """
+    Estima la relación señal-ruido (SNR, en dB) de forma ligera y sin
+    necesitar un segmento de "solo ruido" aparte: divide la señal en
+    ventanas cortas, calcula la energía RMS de cada una, y compara el
+    percentil bajo (ruido de fondo típico) contra el percentil alto
+    (segmentos con voz) — una aproximación práctica y rápida, no un
+    medidor de SNR de laboratorio, pero suficiente para descartar audio
+    con demasiado ruido/eco antes de usarlo.
+    """
+    tam = max(int(0.025 * samplerate), 1)
+    salto = max(int(0.010 * samplerate), 1)
+
+    energias = [
+        float(np.sqrt(np.mean(np.square(audio[i:i + tam], dtype=np.float64))))
+        for i in range(0, max(1, len(audio) - tam), salto)
+    ]
+    if not energias:
+        return 0.0
+
+    energias = np.array(energias)
+    ruido = max(float(np.percentile(energias, 15)), 1e-8)
+    señal = float(np.percentile(energias, 90))
+    return float(20 * np.log10(señal / ruido))
+
+
+def validar_calidad_muestra(audio: np.ndarray, samplerate: int = None) -> tuple:
     """
     Validación ligera de calidad de una muestra recién grabada, ANTES de
-    guardarla o compararla. Solo usa estadísticas simples (media de
-    amplitud y proporción de muestras saturadas) — nada de modelos
-    pesados — así que es prácticamente instantánea.
+    guardarla o compararla. Combina 3 chequeos rápidos (nada de modelos
+    pesados, así que es prácticamente instantánea):
+      1) Volumen: ¿hay suficiente señal, o es prácticamente silencio?
+      2) Saturación: ¿el audio está "clippeado" (demasiado cerca del mic)?
+      3) SNR: ¿hay demasiado ruido de fondo/eco respecto a la voz?
 
     Devuelve (es_valida: bool, motivo: str). motivo queda vacío si es válida.
     """
+    samplerate = samplerate or config.SAMPLE_RATE
+
     if audio is None or len(audio) == 0:
         return False, "No se capturó audio (posible corte del micrófono)."
 
@@ -140,7 +161,12 @@ def validar_calidad_muestra(audio: np.ndarray) -> tuple:
     if proporcion_saturada > config.REGISTRO_SATURACION_MAXIMA:
         return False, "El audio tiene demasiado ruido/saturación (aléjate un poco del micrófono)."
 
+    snr_db = _estimar_snr_db(audio, samplerate)
+    if snr_db < config.SNR_MINIMO_DB:
+        return False, f"Hay demasiado ruido de fondo respecto a tu voz (SNR ≈ {snr_db:.1f} dB; busca un lugar más silencioso)."
+
     return True, ""
+
 
 
 def _lpc_coeficientes(frame: np.ndarray, orden: int) -> np.ndarray:
@@ -287,26 +313,40 @@ def _analizar_formantes_y_ritmo(audio: np.ndarray, samplerate: int):
 def extraer_embedding(audio: np.ndarray, samplerate: int = None) -> np.ndarray:
     """
     Motor biométrico avanzado: construye un embedding multi-factorial
-    combinando 5 familias de características acústicas independientes,
-    cada una normalizada (L2) por separado antes de unirse:
+    combinando FACTORES FISIOLÓGICOS (anatomía del tracto vocal) y
+    FACTORES COMPORTAMENTALES (forma de hablar), cada bloque normalizado
+    (L2) por separado antes de unirse:
 
-      1) MFCC (media+std)        -> timbre general del tracto vocal
-      2) F0 (media+std)          -> tono / entonación
-      3) Formantes F1,F2,F3      -> resonancia específica del tracto vocal
-         (media+std, vía LPC/Levinson-Durbin)
-      4) Energía espectral       -> RMS, centroide, ancho de banda y
-         (media+std)                planitud espectral (intensidad y "perfil de ruido")
-      5) Patrones temporales     -> proporción de voz, tiempo de inicio
-                                     (VOT), número y duración media de pausas (ritmo)
+    Fisiológicos:
+      1) MFCC + Delta + Delta-Delta  -> timbre y su DINÁMICA de transición
+         (media+std cada uno)           (cómo cambia el tracto vocal en el tiempo,
+                                         no solo su forma "promedio")
+      2) F0 (media+std)              -> tono/entonación (tensión de cuerdas vocales)
+      3) Formantes F1,F2,F3          -> resonancia específica del tracto vocal
+         (media+std, vía LPC)           (boca, faringe, cavidades)
+
+    Comportamentales:
+      4) Patrones temporales         -> proporción de voz, tiempo de inicio
+                                         (VOT), número y duración media de pausas (ritmo/cadencia)
+      5) Energía espectral           -> RMS, centroide, ancho de banda y
+         (media+std)                    planitud espectral (intensidad, "perfil de ruido")
+      6) Contraste espectral         -> diferencia pico/valle por banda de
+         (media+std por banda)          frecuencia (textura espectral de la dicción)
+      7) Tasa de cruce por cero      -> rasgo de articulación (consonantes
+         (ZCR, media+std)               sordas/fricativas vs. vocales)
+
+    Preprocesamiento (antes de todo lo anterior):
+      - VAD: se recorta el silencio de los extremos con librosa.effects.trim
+        (así el embedding no se "diluye" con silencio de sobra).
 
     Args:
         audio: señal de audio (numpy array, mono).
         samplerate: frecuencia de muestreo (por defecto config.SAMPLE_RATE).
 
     Returns:
-        np.ndarray 1D con el embedding combinado (60 dimensiones con la
-        configuración por defecto: 40 MFCC + 2 F0 + 6 formantes + 4
-        temporales + 8 energía).
+        np.ndarray 1D con el embedding combinado (156 dimensiones con la
+        configuración por defecto: MFCC 40 + Delta 40 + Delta-Delta 40 +
+        F0 2 + formantes 6 + temporal 4 + energía 8 + contraste 14 + ZCR 2).
     """
     samplerate = samplerate or config.SAMPLE_RATE
 
@@ -315,12 +355,27 @@ def extraer_embedding(audio: np.ndarray, samplerate: int = None) -> np.ndarray:
 
     audio = audio.astype(np.float32)
 
-    # --- 1) MFCC: timbre general ---
+    # --- Preprocesamiento: VAD (recorte de silencio en los extremos) ---
+    audio_recortado, _ = librosa.effects.trim(audio, top_db=config.VAD_TOP_DB)
+    if len(audio_recortado) > 0:
+        audio = audio_recortado
+    del audio_recortado
+
+    # --- 1) MFCC + Delta + Delta-Delta: timbre y su dinámica temporal ---
     mfcc = librosa.feature.mfcc(y=audio, sr=samplerate, n_mfcc=config.N_MFCC)
+    delta = librosa.feature.delta(mfcc, order=1)
+    delta2 = librosa.feature.delta(mfcc, order=2)
+
     bloque_mfcc = _normalizar_bloque(
         np.concatenate([mfcc.mean(axis=1), mfcc.std(axis=1)]).astype(np.float64)
     )
-    del mfcc  # libera el espectrograma MFCC apenas se resume a media/std
+    bloque_delta = _normalizar_bloque(
+        np.concatenate([delta.mean(axis=1), delta.std(axis=1)]).astype(np.float64)
+    )
+    bloque_delta2 = _normalizar_bloque(
+        np.concatenate([delta2.mean(axis=1), delta2.std(axis=1)]).astype(np.float64)
+    )
+    del mfcc, delta, delta2  # libera los espectrogramas apenas se resumen a media/std
 
     # --- 2) F0: tono ---
     f0_serie = librosa.yin(audio, fmin=config.F0_MIN, fmax=config.F0_MAX, sr=samplerate)
@@ -361,13 +416,149 @@ def extraer_embedding(audio: np.ndarray, samplerate: int = None) -> np.ndarray:
         ancho_banda.mean(), ancho_banda.std(),
         planitud.mean(), planitud.std(),
     ], dtype=np.float64))
-    del rms, centroide, ancho_banda, planitud  # libera los arreglos espectrales de inmediato
+    del rms, centroide, ancho_banda, planitud
+
+    # --- 5) Contraste espectral: textura espectral de la dicción ---
+    contraste = librosa.feature.spectral_contrast(y=audio, sr=samplerate)
+    bloque_contraste = _normalizar_bloque(
+        np.concatenate([contraste.mean(axis=1), contraste.std(axis=1)]).astype(np.float64)
+    )
+    del contraste
+
+    # --- 6) Tasa de cruce por cero (ZCR): rasgo de articulación ---
+    zcr = librosa.feature.zero_crossing_rate(audio)[0]
+    bloque_zcr = _normalizar_bloque(np.array([zcr.mean(), zcr.std()], dtype=np.float64))
+    del zcr
 
     embedding = np.concatenate([
-        bloque_mfcc, bloque_f0, bloque_formantes, bloque_temporal, bloque_energia
+        bloque_mfcc, bloque_delta, bloque_delta2,
+        bloque_f0, bloque_formantes, bloque_temporal,
+        bloque_energia, bloque_contraste, bloque_zcr,
     ])
 
     return embedding
+
+
+def distancia_euclidiana(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Distancia euclidiana entre dos embeddings. Se usa como SEGUNDA métrica,
+    junto a la similitud coseno, en el motor de comparación estricto: una
+    identificación solo se acepta si ambas métricas coinciden en que las
+    voces son cercanas — exigir dos criterios distintos reduce los falsos
+    positivos que una sola métrica, por separado, podría dejar pasar.
+    """
+    return float(np.linalg.norm(a - b))
+
+
+def calcular_puntaje_vivacidad(audio: np.ndarray, samplerate: int = None) -> float:
+    """
+    Heurística LIVIANA e INFORMATIVA de "detección de vida" (liveness).
+
+    ADVERTENCIA IMPORTANTE — leer antes de confiar en esto:
+    Esto NO es un sistema de anti-spoofing robusto. Los sistemas reales de
+    detección de repeticiones/audio sintético (p. ej. los del reto público
+    ASVspoof) usan clasificadores entrenados sobre datasets especializados
+    con características como CQCC, y muchas veces hardware adicional
+    (varios micrófonos, sensores de proximidad). Esta función solo calcula
+    dos señales muy básicas que TIENDEN a diferir entre voz en vivo y una
+    grabación reproducida por un parlante de calidad media/baja:
+
+      - Naturalidad del F0 (jitter): la voz humana en vivo varía de forma
+        sutil e irregular entre frame y frame; un F0 anormalmente "plano"
+        puede ser señal (no prueba) de una fuente sintética o muy comprimida.
+      - Energía en frecuencias altas (>4kHz): muchos parlantes/altavoces
+        económicos atenúan las frecuencias más altas del rango audible.
+
+    Devuelve un puntaje 0.0-1.0 (más alto = más "señales de vida"
+    detectadas). Úsalo SOLO como advertencia informativa al usuario, NUNCA
+    como bloqueo automático — puede dar falsos positivos y negativos con
+    facilidad, y bloquear a alguien real por esto sería peor que no
+    chequearlo.
+    """
+    samplerate = samplerate or config.SAMPLE_RATE
+    if audio is None or len(audio) == 0:
+        return 0.0
+
+    audio = audio.astype(np.float32)
+
+    try:
+        f0_serie = librosa.yin(audio, fmin=config.F0_MIN, fmax=config.F0_MAX, sr=samplerate)
+        f0_validos = f0_serie[(f0_serie > config.F0_MIN) & (f0_serie < config.F0_MAX)]
+        if len(f0_validos) > 3:
+            jitter = float(np.std(np.diff(f0_validos)))
+            señal_jitter = min(1.0, jitter / 5.0)  # normalizado empíricamente
+        else:
+            señal_jitter = 0.0
+    except Exception:
+        señal_jitter = 0.0
+
+    try:
+        espectro = np.abs(np.fft.rfft(audio))
+        frecuencias = np.fft.rfftfreq(len(audio), d=1.0 / samplerate)
+        energia_total = float(np.sum(espectro)) + 1e-9
+        energia_alta = float(np.sum(espectro[frecuencias > 4000]))
+        señal_agudos = min(1.0, (energia_alta / energia_total) * 10)
+    except Exception:
+        señal_agudos = 0.0
+
+    return float(0.5 * señal_jitter + 0.5 * señal_agudos)
+
+
+def identificar_conversacion_continua(*args, **kwargs):
+    """
+    Punto de extensión para captura PASIVA (texto-independiente): analizar
+    una conversación continua en vez de una frase leída puntualmente.
+
+    NO implementada todavía en esta fase — se deja como función explícita
+    (en vez de omitirla) para que main.py pueda integrarla más adelante
+    sin rediseñar el resto del sistema. Arquitectura prevista:
+
+      1) Capturar audio en streaming (sd.InputStream, igual que ya hace
+         grabar_audio_con_analisis).
+      2) Trocear el stream en ventanas deslizantes (p. ej. 3s, salto 1s).
+      3) Aplicar VAD (como en extraer_embedding) para descartar ventanas
+         sin voz real.
+      4) Extraer el MISMO embedding multi-factorial (extraer_embedding)
+         sobre cada ventana con voz — se reutiliza tal cual, sin duplicar
+         lógica de features.
+      5) Comparar cada ventana contra los perfiles registrados y agregar
+         los resultados (p. ej. votación entre ventanas) para una decisión
+         más robusta que una sola muestra puntual.
+    """
+    raise NotImplementedError(
+        "Captura pasiva (texto-independiente) todavía no está implementada; "
+        "ver el docstring de esta función para la arquitectura prevista."
+    )
+
+
+def cuenta_regresiva(segundos: int = None) -> None:
+    """
+    Cuenta regresiva visual en la terminal antes de empezar a grabar, para
+    darle tiempo al usuario de prepararse y ubicar el texto a leer. Usa la
+    misma técnica \\r (reescribir la línea) que las barras en vivo, así
+    que no hace scroll ni parpadea.
+    """
+    segundos = segundos or config.CUENTA_REGRESIVA_SEG
+    for i in range(segundos, 0, -1):
+        print(f"\r🔴 Grabando en... {i}  ", end="", flush=True)
+        time.sleep(1)
+    print("\r🎙️  ¡Ahora! Comienza a leer.          ")
+
+
+def reproducir_audio(audio: np.ndarray, samplerate: int = None) -> None:
+    """
+    Reproduce un array de audio ya en memoria (el que se acaba de grabar),
+    sin necesidad de releer ni desencriptar nada desde disco. Usa
+    sounddevice, que ya es una dependencia del proyecto — no hace falta
+    instalar playsound ni nada adicional.
+    """
+    samplerate = samplerate or config.SAMPLE_RATE
+    try:
+        print("🔊 Reproduciendo...")
+        sd.play(audio, samplerate)
+        sd.wait()
+    except Exception as e:
+        print(f"⚠️  No se pudo reproducir el audio: {e}")
 
 
 def cargar_audio_desde_archivo(ruta: str) -> np.ndarray:
