@@ -131,12 +131,36 @@ def registrar_persona() -> None:
 def identificar_persona() -> None:
     session = db.SessionLocal()
     try:
-        perfiles = db.obtener_embeddings_todos(session)
+        perfiles_todos = db.obtener_embeddings_todos(session)
     finally:
         session.close()
 
-    if not perfiles:
+    if not perfiles_todos:
         print("⚠️  No hay personas registradas todavía. Usa la opción 1 primero.")
+        return
+
+    # Solo se comparan embeddings generados con la versión VIGENTE del
+    # pipeline (y con la dimensión esperada, como chequeo extra). Esto es
+    # lo que evita el error "shapes (156,) and (60,) not aligned": nunca
+    # se intenta comparar un embedding viejo contra uno nuevo.
+    perfiles = [
+        (nombre, emb) for nombre, emb, version in perfiles_todos
+        if version == config.EMBEDDING_VERSION and emb.shape[0] == config.EMBEDDING_DIM
+    ]
+    desactualizados = sorted({
+        nombre for nombre, emb, version in perfiles_todos
+        if version != config.EMBEDDING_VERSION or emb.shape[0] != config.EMBEDDING_DIM
+    })
+
+    if desactualizados:
+        print(
+            f"⚠️  Aviso: {len(desactualizados)} persona(s) tienen muestras de una versión "
+            f"anterior del motor y no se incluyen en esta comparación: {', '.join(desactualizados)}. "
+            "Usa 'Gestionar personas → Re-entrenar' para actualizarlas."
+        )
+
+    if not perfiles:
+        print("⚠️  No hay perfiles compatibles con la versión actual del motor. Registra o re-entrena a alguien primero.")
         return
 
     texto = random.choice(config.TEXTOS_LECTURA_VERIFICACION)
@@ -360,8 +384,57 @@ def _eliminar_persona_flujo() -> None:
         print(f"⚠️  No se encontró a '{nombre}' en el sistema.")
 
 
+def _reproducir_audios_flujo() -> None:
+    """
+    Permite elegir a una persona registrada y reproducir, una por una, sus
+    muestras de audio guardadas (desencriptándolas en memoria desde
+    disco), para verificar físicamente que se grabaron completas y
+    correctamente.
+    """
+    session = db.SessionLocal()
+    try:
+        speakers = db.listar_speakers(session)
+        if not speakers:
+            print("⚠️  No hay personas registradas.")
+            return
+
+        print("\nPersonas registradas:")
+        for i, s in enumerate(speakers, start=1):
+            print(f"  {i}) {s.nombre} ({len(s.muestras)} muestra(s))")
+
+        seleccion = input("\nNúmero de la persona a escuchar (ENTER para cancelar): ").strip()
+        if not seleccion.isdigit() or not (1 <= int(seleccion) <= len(speakers)):
+            print("Cancelado.")
+            return
+
+        speaker = speakers[int(seleccion) - 1]
+        if not speaker.muestras:
+            print(f"⚠️  '{speaker.nombre}' no tiene muestras guardadas.")
+            return
+
+        for i, muestra in enumerate(speaker.muestras, start=1):
+            respuesta = input(
+                f"\nMuestra {i}/{len(speaker.muestras)} de '{speaker.nombre}' "
+                f"(grabada el {muestra.fecha_creacion:%Y-%m-%d %H:%M}). "
+                "¿Reproducir? (s/n, o 'salir' para terminar): "
+            ).strip().lower()
+            if respuesta == "salir":
+                break
+            if respuesta != "s":
+                continue
+            try:
+                audio = ap.cargar_audio_desde_archivo(muestra.ruta_audio)
+                ap.reproducir_audio(audio)
+            except FileNotFoundError:
+                print("⚠️  El archivo de audio ya no existe en disco.")
+            except Exception as e:
+                print(f"⚠️  No se pudo reproducir: {e}")
+    finally:
+        session.close()
+
+
 def gestionar_personas() -> None:
-    """Submenú para editar personas ya registradas (renombrar / re-entrenar)."""
+    """Submenú para editar personas ya registradas (renombrar / re-entrenar / escuchar)."""
     while True:
         print("\n" + "-" * 50)
         print("  GESTIONAR PERSONAS REGISTRADAS")
@@ -369,7 +442,8 @@ def gestionar_personas() -> None:
         print("1) Ver personas registradas")
         print("2) Renombrar una persona")
         print("3) Re-entrenar (reemplazar sus muestras de voz)")
-        print("4) Volver al menú principal")
+        print("4) Reproducir audios guardados (verificar grabaciones)")
+        print("5) Volver al menú principal")
         opcion = input("\nSelecciona una opción: ").strip()
 
         if opcion == "1":
@@ -379,6 +453,8 @@ def gestionar_personas() -> None:
         elif opcion == "3":
             _reentrenar_persona_flujo()
         elif opcion == "4":
+            _reproducir_audios_flujo()
+        elif opcion == "5":
             return
         else:
             print("❌ Opción no válida, intenta de nuevo.")
@@ -436,7 +512,7 @@ def ejecutar_pruebas_automaticas() -> None:
         finally:
             session.close()
 
-        if any(nombre == "_usuario_prueba_" for nombre, _ in perfiles):
+        if any(nombre == "_usuario_prueba_" for nombre, _, _ in perfiles):
             print(f"   ✅ Base de datos OK. Registro de prueba guardado en: {config.DB_PATH}")
         else:
             raise RuntimeError("El registro de prueba no se encontró después de guardarlo.")

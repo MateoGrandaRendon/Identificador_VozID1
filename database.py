@@ -61,6 +61,11 @@ class VoiceSample(Base):
     ruta_audio = Column(String(300), nullable=False)       # archivo .wav
     ruta_embedding = Column(String(300), nullable=False)   # archivo .npy
     fecha_creacion = Column(DateTime, default=datetime.datetime.utcnow)
+    # Con qué versión del pipeline de extracción (config.EMBEDDING_VERSION)
+    # se generó este embedding. Es la clave para detectar embeddings
+    # "desactualizados" tras una mejora del motor, en vez de romper el
+    # programa comparando vectores de dimensiones distintas.
+    version_embedding = Column(Integer, default=0)
 
     speaker = relationship("Speaker", back_populates="muestras")
 
@@ -76,8 +81,29 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 def init_db() -> None:
-    """Crea las tablas en la base de datos si todavía no existen."""
+    """Crea las tablas en la base de datos si todavía no existen, y aplica
+    la migración ligera de esquema (ver _migrar_esquema)."""
     Base.metadata.create_all(engine)
+    _migrar_esquema()
+
+
+def _migrar_esquema() -> None:
+    """
+    Migración manual y ligera: Base.metadata.create_all() SOLO crea tablas
+    que no existen, pero NO agrega columnas nuevas a tablas que ya
+    existían de una versión anterior del proyecto (es una limitación
+    normal de SQLAlchemy con SQLite). Esta función verifica si falta la
+    columna version_embedding y la agrega con ALTER TABLE si hace falta,
+    sin tocar ningún dato existente. Es idempotente: correrla de nuevo en
+    una BD ya migrada no hace nada.
+    """
+    with engine.begin() as conexion:
+        columnas = conexion.execute(text("PRAGMA table_info(voice_samples)")).all()
+        nombres_columnas = {fila[1] for fila in columnas}  # fila[1] = nombre de la columna
+        if "version_embedding" not in nombres_columnas:
+            conexion.execute(
+                text("ALTER TABLE voice_samples ADD COLUMN version_embedding INTEGER DEFAULT 0")
+            )
 
 
 def obtener_o_crear_speaker(session, nombre: str) -> Speaker:
@@ -94,7 +120,9 @@ def obtener_o_crear_speaker(session, nombre: str) -> Speaker:
 def guardar_muestra(session, speaker: Speaker, ruta_audio: str, embedding: np.ndarray) -> VoiceSample:
     """
     Guarda el embedding ENCRIPTADO en disco (mismo nombre base que el audio,
-    con extensión .npy.enc) y registra la referencia (metadatos) en la BD.
+    con extensión .npy.enc) y registra la referencia (metadatos) en la BD,
+    incluyendo la versión vigente del pipeline de extracción
+    (config.EMBEDDING_VERSION) con la que se generó.
 
     El embedding es un dato biométrico (una "huella" numérica de la voz de
     la persona), así que nunca se escribe en texto plano: se serializa con
@@ -112,6 +140,7 @@ def guardar_muestra(session, speaker: Speaker, ruta_audio: str, embedding: np.nd
         speaker_id=speaker.id,
         ruta_audio=str(ruta_audio),
         ruta_embedding=ruta_embedding,
+        version_embedding=config.EMBEDDING_VERSION,
     )
     session.add(muestra)
     session.commit()
@@ -126,9 +155,14 @@ def listar_speakers(session):
 
 def obtener_embeddings_todos(session):
     """
-    Carga y DESENCRIPTA todos los embeddings guardados en disco, y los
-    devuelve como una lista de tuplas (nombre_speaker, embedding_numpy).
-    Se usa para comparar una voz nueva contra todos los perfiles registrados.
+    Carga y DESENCRIPTA todos los embeddings guardados en disco, junto con
+    la versión del pipeline con la que se generó cada uno. Devuelve una
+    lista de tuplas (nombre_speaker, embedding_numpy, version_embedding).
+
+    Se usa para comparar una voz nueva contra todos los perfiles
+    registrados; quien llama decide qué hacer con embeddings de una
+    versión distinta a config.EMBEDDING_VERSION (normalmente: no
+    compararlos, y avisar que esa persona necesita re-entrenarse).
     """
     resultados = []
     for muestra in session.query(VoiceSample).all():
@@ -136,7 +170,7 @@ def obtener_embeddings_todos(session):
             datos_encriptados = Path(muestra.ruta_embedding).read_bytes()
             datos_planos = security.desencriptar_bytes(datos_encriptados)
             embedding = np.load(io.BytesIO(datos_planos))
-            resultados.append((muestra.speaker.nombre, embedding))
+            resultados.append((muestra.speaker.nombre, embedding, muestra.version_embedding))
         except FileNotFoundError:
             # Si el archivo .npy.enc fue borrado manualmente, se ignora esa muestra
             continue

@@ -81,6 +81,19 @@ UMBRAL_SIMILITUD = 0.90    # umbral de similitud coseno (0-1) para aceptar una c
                              # señal sintética libre de ruido — ajusta con tus propias pruebas reales.
 
 # ---------------------------------------------------------------------------
+# Versión del pipeline de extracción de embeddings
+# ---------------------------------------------------------------------------
+# Sube este número cada vez que cambies QUÉ características entran al
+# embedding (agregar/quitar bloques, cambiar N_MFCC, etc.). Cada embedding
+# se "sella" con esta versión al guardarse (ver database.guardar_muestra).
+# Si luego mejoras el pipeline y la dimensión cambia, los perfiles viejos
+# se detectan automáticamente como desactualizados — en vez de romper el
+# programa comparando vectores de tamaños distintos — y el sistema avisa
+# qué personas necesitan re-entrenarse (Gestionar personas → Re-entrenar).
+EMBEDDING_VERSION = 2
+EMBEDDING_DIM = 156   # dimensión esperada del embedding con la versión actual
+
+# ---------------------------------------------------------------------------
 # Parámetros de extracción de características (MFCC)
 # ---------------------------------------------------------------------------
 N_MFCC = 20   # número de coeficientes MFCC a extraer por frame

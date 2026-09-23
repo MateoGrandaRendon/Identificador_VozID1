@@ -446,7 +446,17 @@ def distancia_euclidiana(a: np.ndarray, b: np.ndarray) -> float:
     identificación solo se acepta si ambas métricas coinciden en que las
     voces son cercanas — exigir dos criterios distintos reduce los falsos
     positivos que una sola métrica, por separado, podría dejar pasar.
+
+    Blindaje defensivo: si a y b tienen dimensiones distintas (típicamente
+    porque uno se generó con una versión anterior del pipeline de
+    extracción), NO se intenta la resta — eso lanzaría un ValueError y
+    tumbaría el programa. En su lugar se devuelve infinito: "lo más lejos
+    posible", nunca una coincidencia válida. El filtrado por versión en
+    main.py/database.py ya debería evitar que esto ocurra, pero esta
+    función nunca debe depender solo de que otra capa se acuerde de filtrar.
     """
+    if a.shape != b.shape:
+        return float("inf")
     return float(np.linalg.norm(a - b))
 
 
@@ -576,7 +586,15 @@ def similitud_coseno(a: np.ndarray, b: np.ndarray) -> float:
     """
     Calcula la similitud coseno entre dos embeddings (valor entre -1 y 1;
     en la práctica, entre 0 y 1 para voces reales). 1.0 = idénticos.
+
+    Blindaje defensivo: si a y b tienen dimensiones distintas (embeddings
+    generados con versiones distintas del pipeline de extracción),
+    np.dot(a, b) lanzaría "ValueError: shapes ... not aligned" — el error
+    exacto que rompía el programa antes de este cambio. Ahora, en ese
+    caso, se devuelve -1.0 ("lo más distinto posible") en vez de crashear.
     """
+    if a.shape != b.shape:
+        return -1.0
     norma_a = np.linalg.norm(a)
     norma_b = np.linalg.norm(b)
     if norma_a == 0 or norma_b == 0:
