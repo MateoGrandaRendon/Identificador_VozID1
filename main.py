@@ -25,6 +25,7 @@ import numpy as np
 import config
 import database as db
 import audio_processor as ap
+import matching
 import security
 
 
@@ -139,18 +140,11 @@ def identificar_persona() -> None:
         print("⚠️  No hay personas registradas todavía. Usa la opción 1 primero.")
         return
 
-    # Solo se comparan embeddings generados con la versión VIGENTE del
-    # pipeline (y con la dimensión esperada, como chequeo extra). Esto es
-    # lo que evita el error "shapes (156,) and (60,) not aligned": nunca
-    # se intenta comparar un embedding viejo contra uno nuevo.
-    perfiles = [
-        (nombre, emb) for nombre, emb, version in perfiles_todos
-        if version == config.EMBEDDING_VERSION and emb.shape[0] == config.EMBEDDING_DIM
-    ]
-    desactualizados = sorted({
-        nombre for nombre, emb, version in perfiles_todos
-        if version != config.EMBEDDING_VERSION or emb.shape[0] != config.EMBEDDING_DIM
-    })
+    # Solo se comparan embeddings generados con la versión Y dimensión
+    # VIGENTES del pipeline (matching.filtrar_perfiles_compatibles). Esto
+    # es lo que evita el error "shapes (156,) and (60,) not aligned":
+    # nunca se intenta comparar un embedding viejo contra uno nuevo.
+    perfiles, desactualizados = matching.filtrar_perfiles_compatibles(perfiles_todos)
 
     if desactualizados:
         print(
@@ -180,23 +174,17 @@ def identificar_persona() -> None:
     embedding_nuevo = ap.extraer_embedding(audio)
 
     # --- Motor de comparación ESTRICTO: coseno Y euclidiana deben coincidir ---
-    mejor_nombre, mejor_similitud, mejor_distancia = None, -1.0, float("inf")
-    for nombre, embedding in perfiles:
-        similitud = ap.similitud_coseno(embedding_nuevo, embedding)
-        distancia = ap.distancia_euclidiana(embedding_nuevo, embedding)
-        # Se elige el candidato con mayor similitud coseno (métrica principal);
-        # la distancia euclidiana de ESE candidato se evalúa después como
-        # segundo criterio obligatorio, no como desempate.
-        if similitud > mejor_similitud:
-            mejor_similitud, mejor_distancia, mejor_nombre = similitud, distancia, nombre
+    # (lógica de decisión centralizada en matching.py, reutilizable por la
+    # futura API/GUI sin duplicar código ni riesgo de reintroducir el bug)
+    resultado = matching.identificar_mejor_candidato(embedding_nuevo, perfiles)
 
-    print(f"\nMejor candidato: '{mejor_nombre}'  |  similitud coseno: {mejor_similitud:.4f}  |  distancia euclidiana: {mejor_distancia:.4f}")
+    print(
+        f"\nMejor candidato: '{resultado.nombre}'  |  similitud coseno: {resultado.similitud:.4f}  "
+        f"|  distancia euclidiana: {resultado.distancia:.4f}"
+    )
 
-    coincide_coseno = mejor_similitud >= config.UMBRAL_SIMILITUD
-    coincide_euclidiana = mejor_distancia <= config.UMBRAL_DISTANCIA_EUCLIDIANA
-
-    if coincide_coseno and coincide_euclidiana:
-        print(f"🟢 IDENTIFICADO como: {mejor_nombre} (confianza {mejor_similitud:.1%})")
+    if resultado.identificado:
+        print(f"🟢 IDENTIFICADO como: {resultado.nombre} (confianza {resultado.similitud:.1%})")
 
         vivacidad = ap.calcular_puntaje_vivacidad(audio)
         if vivacidad < config.VIVACIDAD_UMBRAL:
@@ -220,11 +208,27 @@ def listar_personas() -> None:
             print("⚠️  No hay personas registradas.")
             return
 
+        # Diagnóstico por persona: cuántas de sus muestras son compatibles
+        # con la versión/dimensión VIGENTE del motor (config.EMBEDDING_VERSION
+        # / config.EMBEDDING_DIM). Sin esto, una persona "registrada" podía
+        # nunca ser reconocida sin que el usuario entendiera por qué — el
+        # filtro de identificar_persona la excluía en silencio.
+        diagnostico = {d["nombre"]: d for d in db.diagnostico_embeddings(session)}
+
         print("\nPersonas registradas:")
         for s in speakers:
+            info = diagnostico.get(s.nombre, {})
+            estado = ""
+            if info.get("necesita_reentrenar"):
+                estado = "  ⚠️  DESACTUALIZADA (re-entrenar antes de poder identificarse)"
+            elif info.get("muestras_compatibles", 0) < info.get("total_muestras", 0):
+                estado = (
+                    f"  ⚠️  {info['total_muestras'] - info['muestras_compatibles']} "
+                    "muestra(s) obsoleta(s) mezclada(s) con muestras vigentes"
+                )
             print(
                 f"  - {s.nombre}  (id={s.id}, muestras={len(s.muestras)}, "
-                f"desde={s.fecha_registro:%Y-%m-%d %H:%M})"
+                f"desde={s.fecha_registro:%Y-%m-%d %H:%M}){estado}"
             )
     finally:
         session.close()

@@ -177,6 +177,50 @@ def obtener_embeddings_todos(session):
     return resultados
 
 
+def diagnostico_embeddings(session) -> list[dict]:
+    """
+    Para cada Speaker registrado, cuenta cuántas de sus muestras son
+    compatibles con la versión Y dimensión VIGENTES del pipeline
+    (config.EMBEDDING_VERSION / config.EMBEDDING_DIM).
+
+    Existe para que el usuario VEA quién necesita re-entrenarse (opción
+    "Gestionar personas") en vez de descubrirlo implícitamente porque esa
+    persona "nunca es reconocida" al identificar — identificar_persona ya
+    filtra en silencio los perfiles incompatibles (correcto para no
+    crashear), pero eso no debe ser invisible en el resto de la app.
+
+    Devuelve una lista de dicts:
+        {
+            "nombre": str,
+            "total_muestras": int,
+            "muestras_compatibles": int,
+            "necesita_reentrenar": bool,  # True si NINGUNA muestra sirve
+        }
+    """
+    resultados = []
+    for speaker in listar_speakers(session):
+        total = len(speaker.muestras)
+        compatibles = 0
+        for muestra in speaker.muestras:
+            if muestra.version_embedding != config.EMBEDDING_VERSION:
+                continue
+            try:
+                datos_encriptados = Path(muestra.ruta_embedding).read_bytes()
+                datos_planos = security.desencriptar_bytes(datos_encriptados)
+                embedding = np.load(io.BytesIO(datos_planos))
+                if embedding.shape[0] == config.EMBEDDING_DIM:
+                    compatibles += 1
+            except FileNotFoundError:
+                continue
+        resultados.append({
+            "nombre": speaker.nombre,
+            "total_muestras": total,
+            "muestras_compatibles": compatibles,
+            "necesita_reentrenar": total > 0 and compatibles == 0,
+        })
+    return resultados
+
+
 def eliminar_speaker_completo(nombre: str) -> tuple[bool, int]:
     """
     Elimina un speaker de forma QUIRÚRGICA Y DIRECTA:
