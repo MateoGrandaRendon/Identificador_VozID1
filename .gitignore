@@ -1,21 +1,47 @@
-# Entorno virtual
+# Entornos virtuales
 .venv/
+.venv*/
 venv/
 
-# Datos locales generados por la app (audios, embeddings y base de datos)
+# Datos locales generados por la app (audios, logs y la antigua BD SQLite)
 data/
 
-# Variables de entorno y secretos — NUNCA se suben (PIN, clave de encriptación)
+# Variables de entorno y secretos — NUNCA se suben (PIN, clave de encriptación, URI de MongoDB)
 .env
+.env.*
+!.env.example
 *.key
 *.pem
+*.p12
+*.pfx
 
-# Cache de Python
+# Copias de seguridad y volcados de base de datos (contienen datos personales)
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*~
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bson
+*.archive
+*.gz
+*.zip
+dump/
+backup*/
+*.log
+
+# Cache de Python y de pruebas
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Configuración de VS Code (opcional, puedes quitar esta línea si quieres versionarla)
 .vscode/
 
 # Archivos de sistema
 .DS_Store
+Thumbs.db

@@ -11,12 +11,14 @@ en .gitignore).
 Uso (con el entorno virtual activado):
     python setup_seguridad.py
 
-⚠️  IMPORTANTE: si vuelves a correr este script, la clave de encriptación
-anterior se pierde y los archivos .npy/.wav ya guardados con esa clave
-quedarán ilegibles. Guarda el PIN en un lugar seguro.
+Si vuelves a correrlo, puedes conservar la clave de encriptación actual y
+cambiar solo el PIN. Si generas una clave NUEVA, los embeddings y audios
+ya guardados con la anterior quedarán ilegibles. Las variables
+VOICE_ID_MONGODB_* que ya existieran en el .env se conservan.
 """
 
 import getpass
+import os
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -31,38 +33,59 @@ def main() -> None:
     print("  CONFIGURACIÓN DE SEGURIDAD — Sistema de Identificación de Voz")
     print("=" * 60)
 
+    anteriores = {}
     if ENV_PATH.exists():
-        confirmar = input(
-            "\n⚠️  Ya existe un archivo .env. Continuar lo SOBREESCRIBIRÁ: el PIN\n"
-            "   y la clave de encriptación viejos dejarán de funcionar, y los\n"
-            "   datos ya encriptados con la clave anterior quedarán ilegibles.\n"
-            "   ¿Continuar de todas formas? (s/n): "
+        for linea in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            clave, sep, valor = linea.partition("=")
+            if sep:
+                anteriores[clave.strip()] = valor.strip()
+
+    clave_fernet = None
+    if anteriores.get("VOICE_ID_FERNET_KEY"):
+        conservar = input(
+            "\nYa existe un archivo .env. ¿Conservar la clave de encriptación actual?\n"
+            "   (s = solo cambiar el PIN, los datos guardados siguen legibles;\n"
+            "    n = generar una clave NUEVA: los datos ya guardados quedarán ilegibles) (s/n): "
         ).strip().lower()
-        if confirmar != "s":
+        if conservar == "s":
+            clave_fernet = anteriores["VOICE_ID_FERNET_KEY"]
+        elif input("⚠️  ¿Seguro que quieres perder los datos cifrados actuales? (escribe SI): ").strip() != "SI":
             print("Cancelado. No se modificó nada.")
             return
 
-    print("\nDefine un PIN de acceso (no se mostrará en pantalla mientras lo escribes).")
+    print(
+        f"\nDefine un PIN de acceso de {security.PIN_MIN_LARGO} a {security.PIN_MAX_LARGO} caracteres "
+        "(no se mostrará en pantalla mientras lo escribes)."
+    )
     while True:
         pin1 = getpass.getpass("Nuevo PIN: ").strip()
         pin2 = getpass.getpass("Confirma el PIN: ").strip()
-        if not pin1:
-            print("❌ El PIN no puede estar vacío.")
+        try:
+            security.validar_pin_nuevo(pin1)
+        except ValueError as e:
+            print(f"❌ {e}")
             continue
         if pin1 != pin2:
             print("❌ No coinciden, intenta de nuevo.")
             continue
         break
 
-    sal, hash_pin = security.generar_hash_pin(pin1)
-    clave_fernet = Fernet.generate_key().decode()
+    sal, hash_pin, iteraciones = security.generar_hash_pin(pin1)
+    clave_fernet = clave_fernet or Fernet.generate_key().decode()
 
-    contenido = (
-        f"VOICE_ID_PIN_SALT={sal}\n"
-        f"VOICE_ID_PIN_HASH={hash_pin}\n"
-        f"VOICE_ID_FERNET_KEY={clave_fernet}\n"
-    )
-    ENV_PATH.write_text(contenido, encoding="utf-8")
+    # Se conservan las variables de MongoDB de un .env anterior (la URI puede
+    # llevar credenciales que no deben perderse ni escribirse en el código).
+    lineas = [
+        f"VOICE_ID_PIN_SALT={sal}",
+        f"VOICE_ID_PIN_HASH={hash_pin}",
+        f"VOICE_ID_PIN_ITER={iteraciones}",
+        f"VOICE_ID_FERNET_KEY={clave_fernet}",
+    ] + [f"{k}={v}" for k, v in anteriores.items() if k.startswith("VOICE_ID_MONGODB_")]
+    ENV_PATH.write_text("\n".join(lineas) + "\n", encoding="utf-8")
+    try:
+        os.chmod(ENV_PATH, 0o600)  # solo el dueño puede leerlo (efecto completo en Linux/macOS)
+    except OSError:
+        pass
 
     print(f"\n✅ Configuración guardada en: {ENV_PATH}")
     print("   Este archivo está en .gitignore — NUNCA debe subirse a GitHub.")

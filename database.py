@@ -1,325 +1,454 @@
 """
 database.py
 -----------
-Capa de acceso a datos (ORM con SQLAlchemy sobre SQLite).
+Capa de acceso a datos sobre MongoDB (base de datos NO relacional, pymongo).
 
-Por qué esta elección:
- - SQLite no requiere instalar ni administrar un servidor: ideal para esta
-   Fase 1 / prototipo local que corre desde VS Code.
- - SQLAlchemy desacopla la lógica de negocio del motor de base de datos:
-   si más adelante el proyecto crece (por ejemplo, para la interfaz web),
-   se puede migrar a PostgreSQL/MySQL cambiando solo la cadena de conexión.
- - Los embeddings (vectores numpy que representan la voz) se guardan como
-   archivos .npy en disco, y la base de datos solo almacena la RUTA a ese
-   archivo. Esto evita guardar BLOBs pesados en SQLite y facilita depurar
-   o inspeccionar un embedding de forma independiente.
+Modelo de datos — colección `speakers`, un documento por persona con sus
+muestras de voz EMBEBIDAS (relación "uno a pocos", el patrón idiomático en
+MongoDB):
 
-Modelo de datos:
-    Speaker (persona registrada)
-        └── VoiceSample (una muestra de voz: audio + embedding) [1 a N]
+    {
+      _id:            ObjectId,
+      nombre:         "Ana María",          # tal como se muestra
+      nombre_clave:   "ana maría",          # normalizado; índice ÚNICO
+      fecha_registro: ISODate,
+      muestras: [                           # entre 4 y 25 elementos
+        {
+          archivo_audio:     "<uuid>.wav.enc",   # solo el NOMBRE, nunca una ruta
+          embedding:         BinData,            # vector numpy ENCRIPTADO (Fernet)
+          version_embedding: 2,
+          dim:               156,
+          fecha_creacion:    ISODate,
+        }, ...
+      ]
+    }
+
+Por qué embebido y no en una colección aparte:
+ - Toda escritura sobre UN documento es atómica en MongoDB: registrar,
+   re-entrenar o ampliar las muestras de una persona nunca deja estados a
+   medias, sin necesitar transacciones (que exigen un replica set).
+ - El límite de 4 a 25 muestras se hace cumplir en la propia base de datos
+   con un validador $jsonSchema (minItems / maxItems), además de en el
+   código: ni un cliente con errores puede saltárselo.
+ - 25 embeddings encriptados ocupan ~50 KB: muy lejos del límite de 16 MB
+   por documento.
+
+Seguridad (inyección NoSQL): todos los filtros se construyen aquí con
+valores que se verifican como `str`. Nunca se pasa a pymongo un
+dict recibido desde fuera, así que un valor como {"$ne": ""} no puede
+convertirse en un operador de consulta.
+
+El audio (más pesado) sigue en disco, encriptado, en data/audio/; la base
+de datos solo guarda el nombre del archivo, que se valida contra un patrón
+estricto antes de tocar el disco (evita recorrido de directorios).
 """
 
 import datetime
 import io
+import logging
+import re
+import threading
 from pathlib import Path
 
 import numpy as np
-from sqlalchemy import create_engine, text, Column, Integer, String, DateTime, ForeignKey
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from bson import Binary
+from cryptography.fernet import InvalidToken
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import (
+    CollectionInvalid,
+    DuplicateKeyError,
+    OperationFailure,
+    PyMongoError,
+)
+from pymongo.uri_parser import parse_uri
 
 import config
 import security
 
-Base = declarative_base()
+log = logging.getLogger("voiceid.db")
+
+COLECCION_SPEAKERS = "speakers"
+COLECCION_SEGURIDAD = "estado_seguridad"
+
+# Nombre de archivo de audio válido: generado por audio_processor.guardar_wav
+# (uuid4 en hexadecimal). Cualquier otra cosa (p. ej. "../../x") se rechaza.
+_PATRON_ARCHIVO_AUDIO = re.compile(r"^[0-9a-f]{32}\.wav\.enc$")
+_HOSTS_LOCALES = {"localhost", "127.0.0.1", "::1"}
 
 
-class Speaker(Base):
-    """Representa a una persona registrada en el sistema."""
-
-    __tablename__ = "speakers"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    nombre = Column(String(120), nullable=False, unique=True)
-    fecha_registro = Column(DateTime, default=datetime.datetime.utcnow)
-
-    # Si se borra un Speaker, se borran también sus muestras (cascade)
-    muestras = relationship(
-        "VoiceSample", back_populates="speaker", cascade="all, delete-orphan"
-    )
-
-    def __repr__(self):
-        return f"<Speaker id={self.id} nombre='{self.nombre}'>"
+class BaseDatosError(Exception):
+    """Error de la capa de datos con un mensaje apto para mostrar al usuario."""
 
 
-class VoiceSample(Base):
-    """Una muestra de voz individual (audio + embedding) de un Speaker."""
-
-    __tablename__ = "voice_samples"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    speaker_id = Column(Integer, ForeignKey("speakers.id"), nullable=False)
-    ruta_audio = Column(String(300), nullable=False)       # archivo .wav
-    ruta_embedding = Column(String(300), nullable=False)   # archivo .npy
-    fecha_creacion = Column(DateTime, default=datetime.datetime.utcnow)
-    # Con qué versión del pipeline de extracción (config.EMBEDDING_VERSION)
-    # se generó este embedding. Es la clave para detectar embeddings
-    # "desactualizados" tras una mejora del motor, en vez de romper el
-    # programa comparando vectores de dimensiones distintas.
-    version_embedding = Column(Integer, default=0)
-
-    speaker = relationship("Speaker", back_populates="muestras")
-
-    def __repr__(self):
-        return f"<VoiceSample id={self.id} speaker_id={self.speaker_id}>"
+class LimiteMuestrasError(BaseDatosError):
+    """Se intentó guardar menos del mínimo o más del máximo de muestras por persona."""
 
 
 # ---------------------------------------------------------------------------
-# Motor de base de datos y fábrica de sesiones
+# Conexión
 # ---------------------------------------------------------------------------
-engine = create_engine(f"sqlite:///{config.DB_PATH}", echo=False)
-SessionLocal = sessionmaker(bind=engine)
+_cliente = None
+_lock_cliente = threading.Lock()
+
+
+def _validar_uri(uri: str) -> None:
+    """
+    Rechaza conexiones inseguras a servidores remotos: si algún host no es
+    local, la conexión debe ir cifrada (TLS) y con certificados verificados.
+    mongodb+srv:// activa TLS por defecto en pymongo.
+    """
+    if uri.startswith("mongodb+srv://"):
+        partes = parse_uri(uri.replace("mongodb+srv://", "mongodb://", 1), validate=False)
+        opciones = partes["options"]
+        remoto, tls = True, opciones.get("tls", opciones.get("ssl", True))
+    else:
+        partes = parse_uri(uri)
+        opciones = partes["options"]
+        remoto = any(host not in _HOSTS_LOCALES for host, _ in partes["nodelist"])
+        tls = opciones.get("tls", opciones.get("ssl", False))
+
+    if remoto and not tls:
+        raise BaseDatosError(
+            "La conexión a un MongoDB remoto debe usar TLS. Usa una URI mongodb+srv:// "
+            "o añade 'tls=true' a VOICE_ID_MONGODB_URI en el .env."
+        )
+    if any(opciones.get(k) for k in ("tlsInsecure", "tlsAllowInvalidCertificates", "tlsAllowInvalidHostnames")):
+        raise BaseDatosError("La URI de MongoDB desactiva la verificación de certificados TLS: no está permitido.")
+
+
+def _db():
+    """Devuelve la base de datos, creando el cliente (con pool) la primera vez."""
+    global _cliente
+    if _cliente is None:
+        with _lock_cliente:
+            if _cliente is None:
+                _validar_uri(config.MONGODB_URI)
+                _cliente = MongoClient(
+                    config.MONGODB_URI,
+                    appname="VoiceID",
+                    tz_aware=True,
+                    serverSelectionTimeoutMS=config.MONGODB_TIMEOUT_MS,
+                    connectTimeoutMS=config.MONGODB_TIMEOUT_MS,
+                    socketTimeoutMS=config.MONGODB_TIMEOUT_MS * 4,
+                    maxPoolSize=10,
+                )
+    return _cliente[config.MONGODB_DB]
+
+
+def usar_cliente(cliente) -> None:
+    """Inyecta un cliente ya creado (p. ej. mongomock en las pruebas)."""
+    global _cliente
+    _cliente = cliente
+
+
+def _speakers():
+    return _db()[COLECCION_SPEAKERS]
+
+
+_ESQUEMA_SPEAKERS = {
+    "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["nombre", "nombre_clave", "fecha_registro", "muestras"],
+        "properties": {
+            "nombre": {"bsonType": "string", "minLength": 1, "maxLength": config.NOMBRE_MAX_LARGO},
+            "nombre_clave": {"bsonType": "string", "minLength": 1, "maxLength": config.NOMBRE_MAX_LARGO},
+            "fecha_registro": {"bsonType": "date"},
+            "muestras": {
+                "bsonType": "array",
+                "minItems": config.MIN_MUESTRAS_POR_PERSONA,
+                "maxItems": config.MAX_MUESTRAS_POR_PERSONA,
+                "items": {
+                    "bsonType": "object",
+                    "required": ["archivo_audio", "embedding", "version_embedding", "dim", "fecha_creacion"],
+                    "properties": {
+                        "archivo_audio": {"bsonType": "string", "pattern": _PATRON_ARCHIVO_AUDIO.pattern},
+                        "embedding": {"bsonType": "binData"},
+                        "version_embedding": {"bsonType": "int"},
+                        "dim": {"bsonType": "int"},
+                        "fecha_creacion": {"bsonType": "date"},
+                    },
+                },
+            },
+        },
+    }
+}
 
 
 def init_db() -> None:
-    """Crea las tablas en la base de datos si todavía no existen, y aplica
-    la migración ligera de esquema (ver _migrar_esquema)."""
-    Base.metadata.create_all(engine)
-    _migrar_esquema()
-
-
-def _migrar_esquema() -> None:
     """
-    Migración manual y ligera: Base.metadata.create_all() SOLO crea tablas
-    que no existen, pero NO agrega columnas nuevas a tablas que ya
-    existían de una versión anterior del proyecto (es una limitación
-    normal de SQLAlchemy con SQLite). Esta función verifica si falta la
-    columna version_embedding y la agrega con ALTER TABLE si hace falta,
-    sin tocar ningún dato existente. Es idempotente: correrla de nuevo en
-    una BD ya migrada no hace nada.
+    Verifica la conexión, crea la colección con su validador $jsonSchema y
+    los índices. Es idempotente. Lanza BaseDatosError si MongoDB no responde.
     """
-    with engine.begin() as conexion:
-        columnas = conexion.execute(text("PRAGMA table_info(voice_samples)")).all()
-        nombres_columnas = {fila[1] for fila in columnas}  # fila[1] = nombre de la columna
-        if "version_embedding" not in nombres_columnas:
-            conexion.execute(
-                text("ALTER TABLE voice_samples ADD COLUMN version_embedding INTEGER DEFAULT 0")
-            )
+    try:
+        db = _db()
+        db.command("ping")
+    except PyMongoError as e:
+        log.error("No se pudo conectar a MongoDB: %s", type(e).__name__)
+        raise BaseDatosError(
+            "No se pudo conectar a MongoDB. Verifica que el servidor esté en marcha "
+            "y que VOICE_ID_MONGODB_URI en el .env sea correcta."
+        ) from None
 
-
-def obtener_o_crear_speaker(session, nombre: str) -> Speaker:
-    """Busca un Speaker por nombre; si no existe, lo crea."""
-    speaker = session.query(Speaker).filter_by(nombre=nombre).first()
-    if speaker is None:
-        speaker = Speaker(nombre=nombre)
-        session.add(speaker)
-        session.commit()
-        session.refresh(speaker)
-    return speaker
-
-
-def guardar_muestra(session, speaker: Speaker, ruta_audio: str, embedding: np.ndarray) -> VoiceSample:
-    """
-    Guarda el embedding ENCRIPTADO en disco (mismo nombre base que el audio,
-    con extensión .npy.enc) y registra la referencia (metadatos) en la BD,
-    incluyendo la versión vigente del pipeline de extracción
-    (config.EMBEDDING_VERSION) con la que se generó.
-
-    El embedding es un dato biométrico (una "huella" numérica de la voz de
-    la persona), así que nunca se escribe en texto plano: se serializa con
-    numpy a un buffer en memoria, se encripta con Fernet (AES-128
-    autenticado) y solo el resultado encriptado toca el disco.
-    """
-    ruta_embedding = str(ruta_audio).replace(".wav.enc", ".npy.enc").replace(".wav", ".npy.enc")
-
-    buffer = io.BytesIO()
-    np.save(buffer, embedding)
-    datos_encriptados = security.encriptar_bytes(buffer.getvalue())
-    Path(ruta_embedding).write_bytes(datos_encriptados)
-
-    muestra = VoiceSample(
-        speaker_id=speaker.id,
-        ruta_audio=str(ruta_audio),
-        ruta_embedding=ruta_embedding,
-        version_embedding=config.EMBEDDING_VERSION,
-    )
-    session.add(muestra)
-    session.commit()
-    session.refresh(muestra)
-    return muestra
-
-
-def listar_speakers(session):
-    """Devuelve todos los Speakers registrados."""
-    return session.query(Speaker).all()
-
-
-def obtener_embeddings_todos(session):
-    """
-    Carga y DESENCRIPTA todos los embeddings guardados en disco, junto con
-    la versión del pipeline con la que se generó cada uno. Devuelve una
-    lista de tuplas (nombre_speaker, embedding_numpy, version_embedding).
-
-    Se usa para comparar una voz nueva contra todos los perfiles
-    registrados; quien llama decide qué hacer con embeddings de una
-    versión distinta a config.EMBEDDING_VERSION (normalmente: no
-    compararlos, y avisar que esa persona necesita re-entrenarse).
-    """
-    resultados = []
-    for muestra in session.query(VoiceSample).all():
+    try:
+        db.create_collection(COLECCION_SPEAKERS, validator=_ESQUEMA_SPEAKERS, validationLevel="strict")
+    except CollectionInvalid:
+        # Ya existía: se actualiza el validador por si cambiaron los límites.
         try:
-            datos_encriptados = Path(muestra.ruta_embedding).read_bytes()
-            datos_planos = security.desencriptar_bytes(datos_encriptados)
-            embedding = np.load(io.BytesIO(datos_planos))
-            resultados.append((muestra.speaker.nombre, embedding, muestra.version_embedding))
-        except FileNotFoundError:
-            # Si el archivo .npy.enc fue borrado manualmente, se ignora esa muestra
-            continue
-    return resultados
+            db.command({"collMod": COLECCION_SPEAKERS, "validator": _ESQUEMA_SPEAKERS, "validationLevel": "strict"})
+        except (PyMongoError, NotImplementedError) as e:
+            log.warning("No se pudo actualizar el validador de esquema: %s", type(e).__name__)
+    except (OperationFailure, NotImplementedError) as e:
+        # Usuario de MongoDB sin permiso dbAdmin: el código sigue validando los límites.
+        log.warning("No se pudo crear la colección con validador: %s", type(e).__name__)
+
+    _speakers().create_index("nombre_clave", unique=True, name="nombre_unico")
 
 
-def diagnostico_embeddings(session) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Utilidades internas
+# ---------------------------------------------------------------------------
+def _clave(nombre: str) -> str:
+    """Clave de búsqueda/unicidad: 'Ana' y 'ana' se consideran la misma persona."""
+    if not isinstance(nombre, str):
+        raise BaseDatosError("Nombre inválido.")
+    clave = nombre.strip().casefold()
+    if not clave or len(clave) > config.NOMBRE_MAX_LARGO:
+        raise BaseDatosError("Nombre inválido.")
+    return clave
+
+
+def _ahora() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def ruta_audio_segura(archivo_audio: str) -> Path:
     """
-    Para cada Speaker registrado, cuenta cuántas de sus muestras son
-    compatibles con la versión Y dimensión VIGENTES del pipeline
-    (config.EMBEDDING_VERSION / config.EMBEDDING_DIM).
+    Convierte el nombre de archivo guardado en la BD en una ruta dentro de
+    config.AUDIO_DIR, verificando que no pueda escapar de esa carpeta.
+    """
+    if not isinstance(archivo_audio, str) or not _PATRON_ARCHIVO_AUDIO.fullmatch(archivo_audio):
+        raise BaseDatosError("Nombre de archivo de audio inválido.")
+    base = config.AUDIO_DIR.resolve()
+    ruta = (base / archivo_audio).resolve()
+    if ruta.parent != base:
+        raise BaseDatosError("Nombre de archivo de audio inválido.")
+    return ruta
 
-    Existe para que el usuario VEA quién necesita re-entrenarse (opción
-    "Gestionar personas") en vez de descubrirlo implícitamente porque esa
-    persona "nunca es reconocida" al identificar — identificar_persona ya
-    filtra en silencio los perfiles incompatibles (correcto para no
-    crashear), pero eso no debe ser invisible en el resto de la app.
 
-    Devuelve una lista de dicts:
-        {
-            "nombre": str,
-            "total_muestras": int,
-            "muestras_compatibles": int,
-            "necesita_reentrenar": bool,  # True si NINGUNA muestra sirve
-        }
+def borrar_archivos_audio(archivos) -> int:
+    """Borra del disco los audios indicados (solo dentro de AUDIO_DIR). Devuelve cuántos se borraron."""
+    borrados = 0
+    for archivo in archivos:
+        try:
+            ruta_audio_segura(archivo).unlink(missing_ok=True)
+            borrados += 1
+        except (OSError, BaseDatosError):
+            log.warning("No se pudo borrar un archivo de audio")
+    return borrados
+
+
+def _cifrar_embedding(embedding: np.ndarray) -> Binary:
+    buffer = io.BytesIO()
+    np.save(buffer, np.asarray(embedding, dtype=np.float64), allow_pickle=False)
+    return Binary(security.encriptar_bytes(buffer.getvalue()))
+
+
+def _descifrar_embedding(datos: bytes) -> np.ndarray:
+    # allow_pickle=False: un .npy manipulado nunca puede ejecutar código al cargarse.
+    return np.load(io.BytesIO(security.desencriptar_bytes(bytes(datos))), allow_pickle=False)
+
+
+def _doc_muestra(ruta_audio, embedding: np.ndarray) -> dict:
+    archivo = Path(ruta_audio).name
+    ruta_audio_segura(archivo)  # valida el nombre
+    return {
+        "archivo_audio": archivo,
+        "embedding": _cifrar_embedding(embedding),
+        "version_embedding": int(config.EMBEDDING_VERSION),
+        "dim": int(np.asarray(embedding).shape[0]),
+        "fecha_creacion": _ahora(),
+    }
+
+
+def _validar_cantidad(n: int, minimo: int, maximo: int) -> None:
+    if n < minimo or n > maximo:
+        raise LimiteMuestrasError(
+            f"Cada persona debe tener entre {config.MIN_MUESTRAS_POR_PERSONA} y "
+            f"{config.MAX_MUESTRAS_POR_PERSONA} muestras de voz (se intentó guardar {n})."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Operaciones de personas
+# ---------------------------------------------------------------------------
+def obtener_speaker(nombre: str) -> dict | None:
+    """Devuelve el resumen de una persona (sin embeddings) o None si no existe."""
+    doc = _speakers().find_one(
+        {"nombre_clave": _clave(nombre)},
+        {"nombre": 1, "fecha_registro": 1, "muestras.archivo_audio": 1, "muestras.fecha_creacion": 1},
+    )
+    if doc is None:
+        return None
+    return {
+        "id": str(doc["_id"]),
+        "nombre": doc["nombre"],
+        "fecha_registro": doc["fecha_registro"],
+        "muestras": doc.get("muestras", []),
+    }
+
+
+def registrar_speaker(nombre: str, muestras) -> str:
+    """
+    Crea una persona nueva con todas sus muestras en UNA sola escritura.
+    `muestras` es una lista de (ruta_audio, embedding) con entre MIN y MAX
+    elementos. Devuelve "ok" o "duplicado".
+    """
+    muestras = list(muestras)
+    _validar_cantidad(len(muestras), config.MIN_MUESTRAS_POR_PERSONA, config.MAX_MUESTRAS_POR_PERSONA)
+    try:
+        _speakers().insert_one({
+            "nombre": nombre.strip(),
+            "nombre_clave": _clave(nombre),
+            "fecha_registro": _ahora(),
+            "muestras": [_doc_muestra(r, e) for r, e in muestras],
+        })
+    except DuplicateKeyError:
+        return "duplicado"
+    return "ok"
+
+
+def reemplazar_muestras(nombre: str, muestras) -> list[str] | None:
+    """
+    Re-entrenamiento: sustituye atómicamente TODAS las muestras de una
+    persona por las nuevas (entre MIN y MAX). Devuelve los nombres de los
+    audios antiguos (para que quien llama los borre del disco) o None si la
+    persona no existe.
+    """
+    muestras = list(muestras)
+    _validar_cantidad(len(muestras), config.MIN_MUESTRAS_POR_PERSONA, config.MAX_MUESTRAS_POR_PERSONA)
+    anterior = _speakers().find_one_and_update(
+        {"nombre_clave": _clave(nombre)},
+        {"$set": {"muestras": [_doc_muestra(r, e) for r, e in muestras]}},
+        projection={"muestras.archivo_audio": 1},
+        return_document=ReturnDocument.BEFORE,
+    )
+    if anterior is None:
+        return None
+    return [m["archivo_audio"] for m in anterior.get("muestras", [])]
+
+
+def agregar_muestras(nombre: str, muestras) -> str:
+    """
+    Añade muestras a una persona existente sin superar el máximo.
+
+    La condición del límite va DENTRO del filtro de la actualización
+    ("el elemento en la posición MAX-k no existe" ⇔ "hay como mucho MAX-k
+    muestras"), así que dos ventanas añadiendo a la vez no pueden pasar de
+    25 entre ambas. Devuelve "ok", "no_existe" o "limite".
+    """
+    muestras = list(muestras)
+    k = len(muestras)
+    _validar_cantidad(k, 1, config.MAX_MUESTRAS_POR_PERSONA)
+    clave = _clave(nombre)
+    resultado = _speakers().update_one(
+        {"nombre_clave": clave, f"muestras.{config.MAX_MUESTRAS_POR_PERSONA - k}": {"$exists": False}},
+        {"$push": {"muestras": {"$each": [_doc_muestra(r, e) for r, e in muestras]}}},
+    )
+    if resultado.matched_count == 1:
+        return "ok"
+    return "limite" if _speakers().count_documents({"nombre_clave": clave}, limit=1) else "no_existe"
+
+
+def listar_speakers() -> list[dict]:
+    """
+    Lista todas las personas con su diagnóstico de compatibilidad, SIN
+    descifrar ningún embedding (version y dim se guardan en claro).
+    """
+    proyeccion = {"nombre": 1, "fecha_registro": 1, "muestras.version_embedding": 1, "muestras.dim": 1}
+    resultado = []
+    for doc in _speakers().find({}, proyeccion).sort("nombre_clave", 1):
+        muestras = doc.get("muestras", [])
+        compatibles = sum(
+            1 for m in muestras
+            if m.get("version_embedding") == config.EMBEDDING_VERSION and m.get("dim") == config.EMBEDDING_DIM
+        )
+        resultado.append({
+            "id": str(doc["_id"]),
+            "nombre": doc["nombre"],
+            "fecha_registro": doc["fecha_registro"],
+            "total_muestras": len(muestras),
+            "muestras_compatibles": compatibles,
+            "necesita_reentrenar": len(muestras) > 0 and compatibles == 0,
+        })
+    return resultado
+
+
+def diagnostico_embeddings() -> list[dict]:
+    """Compatibilidad de las muestras de cada persona con el motor vigente."""
+    return [
+        {k: p[k] for k in ("nombre", "total_muestras", "muestras_compatibles", "necesita_reentrenar")}
+        for p in listar_speakers()
+    ]
+
+
+def obtener_embeddings_todos() -> list[tuple]:
+    """
+    Carga y DESCIFRA todos los embeddings. Devuelve una lista de tuplas
+    (nombre_speaker, embedding_numpy, version_embedding). Una muestra que
+    no se pueda descifrar (clave distinta o dato alterado) se omite.
     """
     resultados = []
-    for speaker in listar_speakers(session):
-        total = len(speaker.muestras)
-        compatibles = 0
-        for muestra in speaker.muestras:
-            if muestra.version_embedding != config.EMBEDDING_VERSION:
-                continue
+    proyeccion = {"nombre": 1, "muestras.embedding": 1, "muestras.version_embedding": 1}
+    for doc in _speakers().find({}, proyeccion):
+        for m in doc.get("muestras", []):
             try:
-                datos_encriptados = Path(muestra.ruta_embedding).read_bytes()
-                datos_planos = security.desencriptar_bytes(datos_encriptados)
-                embedding = np.load(io.BytesIO(datos_planos))
-                if embedding.shape[0] == config.EMBEDDING_DIM:
-                    compatibles += 1
-            except FileNotFoundError:
-                continue
-        resultados.append({
-            "nombre": speaker.nombre,
-            "total_muestras": total,
-            "muestras_compatibles": compatibles,
-            "necesita_reentrenar": total > 0 and compatibles == 0,
-        })
+                resultados.append((doc["nombre"], _descifrar_embedding(m["embedding"]), m.get("version_embedding", 0)))
+            except (InvalidToken, ValueError, KeyError):
+                log.warning("Embedding ilegible omitido (clave distinta o dato alterado)")
     return resultados
 
 
 def eliminar_speaker_completo(nombre: str) -> tuple[bool, int]:
     """
-    Elimina un speaker de forma QUIRÚRGICA Y DIRECTA:
-
-      - Usa SQL parametrizado (text()) en vez del ORM completo, evitando
-        que SQLAlchemy cargue objetos Python de más (sin "hidratar" el
-        Speaker ni sus VoiceSample como instancias del ORM).
-      - Todo ocurre en UNA SOLA transacción atómica ligera: `engine.begin()`
-        abre la transacción y hace commit() automático al salir del bloque
-        `with` (o rollback si algo falla) — no hay pasos intermedios.
-      - NO genera ningún respaldo (backup) de la base de datos ni vuelca
-        tablas completas: solo lee las 2 rutas de archivo que necesita
-        borrar y ejecuta 2 DELETE puntuales por clave. Es una operación
-        O(muestras de esa persona), nunca O(tamaño total de la BD).
-
-    Los archivos físicos (.wav.enc/.npy.enc) se borran DESPUÉS de que la
-    transacción de la BD ya fue confirmada (commit) — así, si el borrado
-    de un archivo falla (permisos, ya no existe), la base de datos queda
-    consistente de todas formas; en el peor caso queda un archivo huérfano
-    en disco, nunca un registro roto.
-
-    Devuelve (existia, archivos_borrados).
+    Elimina a una persona (documento + audios en disco). El documento se
+    borra primero, de forma atómica; si luego falla el borrado de algún
+    archivo, como mucho queda un audio huérfano cifrado, nunca un registro
+    roto. Devuelve (existia, archivos_borrados).
     """
-    with engine.begin() as conexion:  # transacción única: commit automático al salir, rollback si hay error
-        fila_speaker = conexion.execute(
-            text("SELECT id FROM speakers WHERE nombre = :nombre"),
-            {"nombre": nombre},
-        ).first()
+    doc = _speakers().find_one_and_delete({"nombre_clave": _clave(nombre)}, projection={"muestras.archivo_audio": 1})
+    if doc is None:
+        return False, 0
+    return True, borrar_archivos_audio(m["archivo_audio"] for m in doc.get("muestras", []))
 
-        if fila_speaker is None:
-            return False, 0  # no existe: no se abre ninguna operación de escritura
 
-        speaker_id = fila_speaker.id
-
-        filas_muestras = conexion.execute(
-            text("SELECT ruta_audio, ruta_embedding FROM voice_samples WHERE speaker_id = :id"),
-            {"id": speaker_id},
-        ).all()
-
-        # Dos DELETE puntuales y parametrizados, dentro de la MISMA transacción:
-        conexion.execute(
-            text("DELETE FROM voice_samples WHERE speaker_id = :id"), {"id": speaker_id}
+def renombrar_speaker(nombre_actual: str, nombre_nuevo: str) -> str:
+    """Devuelve "ok", "no_existe" o "duplicado"."""
+    clave_actual, clave_nueva = _clave(nombre_actual), _clave(nombre_nuevo)
+    try:
+        r = _speakers().update_one(
+            {"nombre_clave": clave_actual},
+            {"$set": {"nombre": nombre_nuevo.strip(), "nombre_clave": clave_nueva}},
         )
-        conexion.execute(
-            text("DELETE FROM speakers WHERE id = :id"), {"id": speaker_id}
-        )
-    # --- fin del `with engine.begin()`: aquí ya se hizo commit() atómico ---
-
-    borrados = 0
-    for fila in filas_muestras:
-        for ruta in (fila.ruta_audio, fila.ruta_embedding):
-            try:
-                Path(ruta).unlink(missing_ok=True)
-                borrados += 1
-            except OSError:
-                pass  # el archivo ya no existía o no hay permisos: no es un error fatal
-
-    return True, borrados
-
-
-def eliminar_muestras_speaker(session, speaker: Speaker) -> int:
-    """
-    Elimina TODAS las muestras (audio + embedding, en BD y en disco) de un
-    Speaker que YA EXISTE, sin borrar al Speaker en sí. Se usa para
-    "re-entrenar": vaciar las muestras viejas antes de grabar unas nuevas.
-    Devuelve cuántas muestras se eliminaron.
-    """
-    muestras = list(speaker.muestras)
-    for muestra in muestras:
-        for ruta in (muestra.ruta_audio, muestra.ruta_embedding):
-            try:
-                Path(ruta).unlink(missing_ok=True)
-            except OSError:
-                pass
-        session.delete(muestra)
-    session.commit()
-    return len(muestras)
-
-
-def renombrar_speaker(session, nombre_actual: str, nombre_nuevo: str) -> str:
-    """
-    Cambia el nombre de un Speaker existente.
-
-    Devuelve:
-        "ok"        si se renombró correctamente
-        "no_existe" si nombre_actual no está registrado
-        "duplicado" si nombre_nuevo ya lo usa otra persona
-    """
-    if nombre_actual == nombre_nuevo:
-        return "ok"
-
-    speaker = session.query(Speaker).filter_by(nombre=nombre_actual).first()
-    if speaker is None:
-        return "no_existe"
-
-    ya_existe = session.query(Speaker).filter_by(nombre=nombre_nuevo).first()
-    if ya_existe is not None:
+    except DuplicateKeyError:
         return "duplicado"
+    return "ok" if r.matched_count == 1 else "no_existe"
 
-    speaker.nombre = nombre_nuevo
-    session.commit()
-    return "ok"
+
+# ---------------------------------------------------------------------------
+# Estado anti fuerza bruta del PIN (persistente: sobrevive a reinicios)
+# ---------------------------------------------------------------------------
+def leer_estado_pin() -> dict:
+    doc = _db()[COLECCION_SEGURIDAD].find_one({"_id": "pin"}) or {}
+    return {
+        "fallos": int(doc.get("fallos", 0)),
+        "bloqueos": int(doc.get("bloqueos", 0)),
+        "bloqueado_hasta": doc.get("bloqueado_hasta"),
+    }
+
+
+def guardar_estado_pin(fallos: int, bloqueos: int, bloqueado_hasta) -> None:
+    _db()[COLECCION_SEGURIDAD].update_one(
+        {"_id": "pin"},
+        {"$set": {"fallos": int(fallos), "bloqueos": int(bloqueos), "bloqueado_hasta": bloqueado_hasta}},
+        upsert=True,
+    )

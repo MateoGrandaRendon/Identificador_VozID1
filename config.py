@@ -25,6 +25,22 @@ load_dotenv()
 PIN_SALT = os.getenv("VOICE_ID_PIN_SALT")
 PIN_HASH = os.getenv("VOICE_ID_PIN_HASH")
 FERNET_KEY = os.getenv("VOICE_ID_FERNET_KEY")
+# Iteraciones PBKDF2 con las que se generó el hash del PIN. Los .env creados
+# antes de este cambio no traen la variable y usaban 200 000; los nuevos
+# (setup_seguridad.py) usan 600 000, el mínimo recomendado por OWASP (2023).
+PIN_ITERACIONES = int(os.getenv("VOICE_ID_PIN_ITER", "200000"))
+
+# ---------------------------------------------------------------------------
+# Base de datos: MongoDB (no relacional)
+# ---------------------------------------------------------------------------
+# La cadena de conexión (que puede incluir usuario y contraseña) se lee
+# SIEMPRE del .env — nunca se escribe en el código. Por defecto apunta a un
+# MongoDB local sin credenciales. Para un servidor remoto (p. ej. Atlas) usa
+# "mongodb+srv://usuario:clave@cluster/..." o añade "tls=true": la conexión
+# a un host remoto sin TLS se rechaza (ver database._validar_uri).
+MONGODB_URI = os.getenv("VOICE_ID_MONGODB_URI", "mongodb://127.0.0.1:27017")
+MONGODB_DB = os.getenv("VOICE_ID_MONGODB_DB", "voice_id")
+MONGODB_TIMEOUT_MS = int(os.getenv("VOICE_ID_MONGODB_TIMEOUT_MS", "5000"))
 
 # ---------------------------------------------------------------------------
 # Optimización para entornos de nube / contenedores livianos
@@ -47,11 +63,14 @@ os.environ.setdefault("NUMBA_NUM_THREADS", "1")
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audio"          # Muestras de audio (.wav) y embeddings (.npy)
-DB_PATH = DATA_DIR / "voice_id.db"      # Base de datos SQLite
+LOG_DIR = DATA_DIR / "logs"            # Registro técnico de errores (sin datos biométricos)
+SQLITE_LEGADO_PATH = DATA_DIR / "voice_id.db"  # BD SQLite de versiones anteriores (solo para migrar)
 
-# Crear carpetas necesarias si no existen (se ejecuta al importar el módulo)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+# Crear carpetas necesarias si no existen (se ejecuta al importar el módulo).
+# mode=0o700: solo el usuario dueño puede leerlas (en Windows se heredan los
+# permisos de la carpeta del usuario, que ya son privados).
+for _carpeta in (DATA_DIR, AUDIO_DIR, LOG_DIR):
+    _carpeta.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Parámetros de audio
@@ -63,12 +82,13 @@ CHANNELS = 1            # mono
 # ---------------------------------------------------------------------------
 # Parámetros de enrollment (registro de personas)
 # ---------------------------------------------------------------------------
-# IMPORTANTE: esto ya NO es un límite. Es solo el valor sugerido que se
-# muestra por defecto al pedir cuántas muestras grabar; el usuario puede
-# escribir cualquier cantidad, y el número de PERSONAS que se pueden
-# registrar en el sistema no tiene tope (se puede seguir agregando una
-# tras otra en la misma sesión).
-DEFAULT_MUESTRAS_POR_REGISTRO = 4
+# Cada persona debe tener entre MIN y MAX muestras de voz guardadas. El
+# mínimo garantiza una huella robusta; el máximo acota el tamaño del
+# documento en MongoDB y el coste de cada identificación. Se hace cumplir
+# en tres capas: la interfaz, database.py y el validador $jsonSchema de la
+# colección (ver database.init_db).
+MIN_MUESTRAS_POR_PERSONA = 4
+MAX_MUESTRAS_POR_PERSONA = 25
 
 # ---------------------------------------------------------------------------
 # Parámetros de identificación
@@ -154,7 +174,7 @@ REGISTRO_SATURACION_MAXIMA = 0.05     # máx. proporción de muestras "clippeada
 # del español) para construir una huella robusta. La verificación usa un
 # texto de un banco COMPLETAMENTE separado, para no depender de la frase
 # exacta memorizada durante el registro.
-NUM_PASOS_REGISTRO = 4
+NUM_PASOS_REGISTRO = MIN_MUESTRAS_POR_PERSONA   # pasos obligatorios; luego son opcionales hasta el máximo
 
 TEXTOS_LECTURA_REGISTRO = [
     "El veloz murciélago hindú comía feliz cardillo y kiwi mientras el sol se ocultaba.",
@@ -210,3 +230,11 @@ REGISTRO_DURACION_MIN = 10
 REGISTRO_DURACION_MAX = 15
 PALABRAS_POR_SEGUNDO_LECTURA = 2.0   # velocidad de lectura conservadora (~120 palabras/min)
 MARGEN_LECTURA_SEG = 3               # colchón extra para prepararse/terminar sin prisa
+
+# ---------------------------------------------------------------------------
+# Sesión de la interfaz gráfica y límites anti-abuso (DoS)
+# ---------------------------------------------------------------------------
+SESION_INACTIVIDAD_SEG = 10 * 60     # se bloquea tras 10 min sin actividad
+SESION_MAX_SEG = 8 * 60 * 60         # y siempre tras 8 h, aunque haya actividad
+GRABACION_MAX_SEG = 30               # tope duro de una grabación (memoria acotada)
+NOMBRE_MAX_LARGO = 60                # longitud máxima del nombre de una persona

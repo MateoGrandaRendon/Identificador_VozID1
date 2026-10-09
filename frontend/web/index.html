@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="es"><head><meta charset="utf-8"><!--CSP--><meta name="referrer" content="no-referrer"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VoiceID</title><link rel="stylesheet" href="styles.css"></head><body>
 <div id="banner" hidden></div><div id="toasts"></div>
 <div id="lock" class="overlay" hidden><form class="card modal" id="pinform">
   <h2>🔒 Acceso</h2><p id="pinmsg" class="muted">Introduce tu PIN</p>
-  <input id="pin" type="password" autocomplete="off"><div class="row end"><button class="btn">Entrar</button></div></form></div>
+  <input id="pin" type="password" autocomplete="off" maxlength="64"><div class="row end"><button class="btn">Entrar</button></div></form></div>
 
 <div class="app">
 <aside class="nav"><div class="brand"><b>◉</b><span> VoiceID</span></div>
@@ -14,20 +14,22 @@
   <button data-v="gestionar"><i>☰</i><span>Gestionar personas</span></button>
   <button data-v="analisis"><i>∿</i><span>Análisis de voz</span></button>
   <button data-v="pruebas"><i>✔</i><span>Pruebas automáticas</span></button>
+  <button data-v="bloquear"><i>🔒</i><span>Bloquear sesión</span></button>
   <button data-v="salir" class="exit"><i>⏻</i><span>Salir</span></button>
 </aside>
 <main>
 
 <section id="v-registro" class="view" hidden><h1>Registrar persona</h1>
  <div class="grid2"><div>
-  <div class="card" id="reg-setup"><label>Nombre<input id="reg-name" placeholder="Nombre de la persona"></label>
-   <p class="muted">Se graban 4 muestras leyendo un texto distinto cada vez. No se guarda nada hasta pulsar «Completar registro».</p>
+  <div class="card" id="reg-setup"><label>Nombre<input id="reg-name" placeholder="Nombre de la persona" maxlength="60" autocomplete="off"></label>
+   <p class="muted" id="reg-help">Se graban al menos 4 muestras (y opcionalmente hasta 25) leyendo un texto distinto cada vez. No se guarda nada hasta pulsar «Completar registro».</p>
    <button class="btn" id="reg-begin">Comenzar</button></div>
   <div class="card" id="reg-run" hidden>
    <div class="row between"><b id="reg-title"></b><div class="steps" id="reg-steps"></div></div>
    <p class="read" id="reg-text"></p><div data-rec id="reg-rec"></div>
    <div class="row"><button class="btn" id="reg-start">Iniciar grabación</button><button class="btn stop" id="reg-stop" disabled>Detener grabación</button></div>
    <div id="reg-result"></div>
+   <p class="muted" id="reg-count"></p>
    <div class="row"><button class="btn ok" id="reg-finish" hidden>Completar registro</button><button class="btn ghost" id="reg-cancel">Cancelar</button></div></div>
  </div><div class="side" data-cat></div></div></section>
 
@@ -44,7 +46,7 @@
  <div class="card"><div id="del-list" class="list"></div><div class="row"><button class="btn danger" id="del-go" disabled>Eliminar seleccionada</button></div></div></section>
 
 <section id="v-gestionar" class="view" hidden><h1>Gestionar personas</h1>
- <div class="card"><table><thead><tr><th>Nombre</th><th>ID</th><th>Muestras</th><th>Estado</th><th>Registro</th><th>Acciones</th></tr></thead><tbody id="mg-body"></tbody></table></div></section>
+ <div class="card"><table><thead><tr><th>Nombre</th><th>Muestras</th><th>Estado</th><th>Registro</th><th>Acciones</th></tr></thead><tbody id="mg-body"></tbody></table></div></section>
 
 <section id="v-analisis" class="view" hidden><h1>Análisis de modulación de voz</h1>
  <div class="card"><div data-rec id="an-rec"></div>

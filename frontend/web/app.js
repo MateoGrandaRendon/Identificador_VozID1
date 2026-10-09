@@ -1,21 +1,23 @@
 "use strict";
+/* anti-clickjacking: la app nunca debe mostrarse dentro de un marco ajeno */
+if(window.top!==window.self){document.documentElement.innerHTML="";throw new Error("frame")}
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const API=()=>window.pywebview&&window.pywebview.api;
-let CFG={tono_max:15,pasos:4},PEOPLE=[];
+let CFG={tono_max:15,pasos:4,max_muestras:25},PEOPLE=[];
 
 /* ---------- comunicación con el backend (capa única) ---------- */
 function toast(m,k="ok"){const t=document.createElement("div");t.className="toast "+k;t.textContent=m;$("#toasts").append(t);setTimeout(()=>t.remove(),4200)}
 async function rpc(quiet,fn,...a){
   if(!API()){$("#banner").hidden=false;$("#banner").textContent="Sin conexión con el backend. Abre la app con: python -m frontend.app";return{ok:false,error:"Sin conexión con el backend",code:"offline"}}
-  try{const r=await API()[fn](...a);if(!r.ok&&!quiet)toast(r.error,r.code==="mic_unavailable"?"err":"warn");return r}
+  try{const r=await API()[fn](...a);if(!r.ok&&r.code==="auth"){lockUI(r.error);return r}if(!r.ok&&!quiet)toast(r.error,r.code==="mic_unavailable"?"err":"warn");return r}
   catch(e){toast("Sin conexión con el backend","err");return{ok:false,error:String(e),code:"offline"}}
 }
 const call=(f,...a)=>rpc(false,f,...a),callq=(f,...a)=>rpc(true,f,...a);
 
 function modal({title,body="",input=null,ok="Aceptar",cancel="Cancelar",danger=false}){
   return new Promise(res=>{const o=document.createElement("div");o.className="overlay";
-    o.innerHTML=`<div class="card modal"><h3>${title}</h3><div>${body}</div>${input!==null?`<input id="mi" value="${esc(input)}">`:""}<div class="row end">${cancel?`<button class="btn ghost" data-x="0">${cancel}</button>`:""}<button class="btn ${danger?"danger":""}" data-x="1">${ok}</button></div></div>`;
+    o.innerHTML=`<div class="card modal"><h3>${esc(title)}</h3><div>${body}</div>${input!==null?`<input id="mi" value="${esc(input)}">`:""}<div class="row end">${cancel?`<button class="btn ghost" data-x="0">${cancel}</button>`:""}<button class="btn ${danger?"danger":""}" data-x="1">${ok}</button></div></div>`;
     document.body.append(o);const mi=$("#mi",o);if(mi)mi.focus();
     o.onclick=e=>{const x=e.target.dataset.x;if(x===undefined)return;o.remove();res(x==="1"?(mi?mi.value.trim()||true:true):false)}});
 }
@@ -72,13 +74,16 @@ async function doExit(){if(await modal({title:"Salir",body:"Se liberará el micr
 
 /* ---------- registro / re-entrenamiento (asistente de 4 pasos) ---------- */
 let W=null;
+const MODO_TXT={registro:"Registrar",reentrenar:"Re-entrenar",ampliar:"Añadir muestras"};
 function renderWizard(i){W=i;$("#reg-setup").hidden=true;$("#reg-run").hidden=false;
-  $("#reg-title").textContent=`${i.modo==="reentrenar"?"Re-entrenar":"Registrar"}: ${i.nombre}`+(i.completo?"":` · paso ${i.paso}/${i.total}`);
-  $("#reg-steps").innerHTML=Array.from({length:i.total},(_,k)=>`<i class="${k<i.guardadas?"done":k===i.guardadas?"now":""}"></i>`).join("");
-  $("#reg-text").textContent=i.completo?"Todas las muestras están listas. Pulsa «Completar registro».":i.texto;
-  $("#reg-finish").hidden=!i.completo;en("#reg-start",!i.completo);en("#reg-stop",false);$("#reg-result").innerHTML=""}
+  $("#reg-title").textContent=`${MODO_TXT[i.modo]||"Registrar"}: ${i.nombre}`+(i.lleno?"":` · muestra ${i.paso}`);
+  const dots=Math.max(i.min,Math.min(i.max,i.guardadas+1));
+  $("#reg-steps").innerHTML=Array.from({length:dots},(_,k)=>`<i class="${k<i.guardadas?"done":k===i.guardadas?"now":""}"></i>`).join("");
+  $("#reg-text").textContent=i.lleno?"Se alcanzó el máximo de muestras. Pulsa «Completar registro».":i.texto;
+  $("#reg-count").textContent=`${i.guardadas} nueva(s) · mínimo ${i.min}, máximo ${i.max}`+(i.modo==="ampliar"?` · total de la persona: ${i.existentes+i.guardadas}/${CFG.max_muestras}`:"")+(i.completo&&!i.lleno?" · puedes completar ya o grabar más (opcional)":"");
+  $("#reg-finish").hidden=!i.completo;en("#reg-start",!i.lleno);en("#reg-stop",false);$("#reg-result").innerHTML=""}
 async function beginWizard(modo,nombre){const r=await call("wizard_start",nombre,modo);if(r.ok)renderWizard(r.data)}
-init.registro=()=>{if(!W){$("#reg-setup").hidden=false;$("#reg-run").hidden=true;$("#reg-name").value=""}};
+init.registro=()=>{if(!W){$("#reg-setup").hidden=false;$("#reg-run").hidden=true;$("#reg-name").value="";$("#reg-count").textContent=""}};
 $("#reg-begin").onclick=()=>beginWizard("registro",$("#reg-name").value);
 $("#reg-name").onkeydown=e=>e.key==="Enter"&&$("#reg-begin").click();
 $("#reg-start").onclick=async()=>{const r=await call("record_start");if(!r.ok)return;$("#reg-result").innerHTML="";en("#reg-start",false);en("#reg-stop",true);liveStart($("#reg-rec"),{max:W.duracion,onLimit:regStop})};
@@ -86,11 +91,11 @@ async function regStop(){if(!rec.on)return;liveStop();en("#reg-stop",false);cons
   $("#reg-result").innerHTML=r.data.valida
     ?`<p class="status ok">✔ Muestra válida (${r.data.segundos} s)</p><div class="row"><button class="btn ok" id="k-y">Conservar</button><button class="btn ghost" id="k-n">Repetir</button></div>`
     :`<p class="status err">✖ Muestra rechazada: ${esc(r.data.motivo)}</p>`;
-  const y=$("#k-y");if(y){en("#reg-start",false);y.onclick=async()=>{const k=await call("wizard_keep");if(k.ok)renderWizard(k.data)};$("#k-n").onclick=()=>{$("#reg-result").innerHTML="";en("#reg-start",true)}}}
+  const y=$("#k-y");if(y){en("#reg-start",false);y.onclick=async()=>{const k=await call("wizard_keep");if(k.ok)renderWizard(k.data)};$("#k-n").onclick=()=>{$("#reg-result").innerHTML="";en("#reg-start",!W.lleno)}}}
 $("#reg-stop").onclick=regStop;
 $("#reg-finish").onclick=async()=>{en("#reg-finish",false);$("#reg-result").innerHTML=`<p class="status">Procesando y guardando (extrayendo embeddings)…</p>`;
   const r=await call("wizard_finish");en("#reg-finish",true);if(!r.ok){$("#reg-result").innerHTML="";return}
-  toast(`Registro completo para ${r.data}`);W=null;init.registro()};
+  toast(`${r.data.guardadas} muestra(s) guardada(s) para ${r.data.nombre}`);W=null;init.registro()};
 $("#reg-cancel").onclick=async()=>{if(rec.on){liveStop()}await callq("wizard_cancel");W=null;toast("Operación cancelada","warn");init.registro()};
 
 /* ---------- identificar ---------- */
@@ -115,19 +120,21 @@ $("#id-stop").onclick=idStop;
 const badge=p=>p.reentrenar?`<span class="badge w">Desactualizada</span>`:p.compatibles<p.muestras?`<span class="badge w">Parcial</span>`:`<span class="badge">Vigente</span>`;
 async function loadPeople(){const r=await call("list_speakers");PEOPLE=r.ok?r.data:[];return PEOPLE}
 async function deletePerson(p,after){
-  if(!await modal({title:"Eliminar persona",body:`¿Eliminar a <b>${esc(p.nombre)}</b> (id ${p.id}, ${p.muestras} muestras)? Esta acción no se puede deshacer.`,ok:"Eliminar",danger:true}))return toast("Operación cancelada","warn");
+  if(!await modal({title:"Eliminar persona",body:`¿Eliminar a <b>${esc(p.nombre)}</b> (${esc(p.muestras)} muestras de voz)? Se borrarán sus datos biométricos y esta acción no se puede deshacer.`,ok:"Eliminar",danger:true}))return toast("Operación cancelada","warn");
   const r=await call("delete_speaker",p.nombre);if(r.ok){toast(`${p.nombre} eliminada (${r.data} archivos borrados)`);after()}}
 let SEL=null;
 init.eliminar=async()=>{SEL=null;en("#del-go",false);const p=await loadPeople();
-  $("#del-list").innerHTML=p.length?p.map(x=>`<div class="item" data-n="${esc(x.nombre)}"><div class="grow"><b>${esc(x.nombre)}</b><div class="muted">id ${x.id} · ${x.muestras} muestras · ${x.fecha}</div></div>${badge(x)}</div>`).join(""):`<p class="muted">No hay personas registradas.</p>`};
+  $("#del-list").innerHTML=p.length?p.map(x=>`<div class="item" data-n="${esc(x.nombre)}"><div class="grow"><b>${esc(x.nombre)}</b><div class="muted">${esc(x.muestras)} muestras · ${esc(x.fecha)}</div></div>${badge(x)}</div>`).join(""):`<p class="muted">No hay personas registradas.</p>`};
 $("#del-list").onclick=e=>{const it=e.target.closest(".item");if(!it)return;SEL=PEOPLE.find(p=>p.nombre===it.dataset.n);$$("#del-list .item").forEach(x=>x.classList.toggle("sel",x===it));en("#del-go",true)};
 $("#del-go").onclick=()=>SEL&&deletePerson(SEL,init.eliminar);
 init.gestionar=async()=>{const p=await loadPeople();
-  $("#mg-body").innerHTML=p.length?p.map(x=>`<tr><td>${esc(x.nombre)}</td><td>${x.id}</td><td>${x.muestras}</td><td>${badge(x)}</td><td>${x.fecha}</td><td class="acts" data-n="${esc(x.nombre)}"><button data-a="info">Info</button><button data-a="ren">Renombrar</button><button data-a="re">Re-entrenar</button><button data-a="del" class="danger">Eliminar</button></td></tr>`).join(""):`<tr><td colspan="6" class="muted">No hay personas registradas.</td></tr>`};
+  $("#mg-body").innerHTML=p.length?p.map(x=>`<tr><td>${esc(x.nombre)}</td><td>${esc(x.muestras)} / ${esc(CFG.max_muestras)}</td><td>${badge(x)}</td><td>${esc(x.fecha)}</td><td class="acts" data-n="${esc(x.nombre)}"><button data-a="info">Info</button><button data-a="ren">Renombrar</button><button data-a="re">Re-entrenar</button><button data-a="add"${x.muestras>=CFG.max_muestras?" disabled":""}>Añadir muestras</button><button data-a="del" class="danger">Eliminar</button></td></tr>`).join(""):`<tr><td colspan="5" class="muted">No hay personas registradas.</td></tr>`};
 $("#mg-body").onclick=async e=>{const a=e.target.dataset.a,td=e.target.closest(".acts");if(!a||!td)return;const n=td.dataset.n,p=PEOPLE.find(x=>x.nombre===n);
-  if(a==="info")modal({title:esc(n),body:`<p>ID: ${p.id}<br>Registro: ${p.fecha}<br>Muestras: ${p.muestras} (${p.compatibles} compatibles con el motor actual)<br>Estado: ${badge(p)}</p>`,ok:"Cerrar",cancel:""});
+  if(!p)return;
+  if(a==="info")modal({title:n,body:`<p>Registro: ${esc(p.fecha)}<br>Muestras: ${esc(p.muestras)} de máx. ${esc(CFG.max_muestras)} (${esc(p.compatibles)} compatibles con el motor actual)<br>Estado: ${badge(p)}</p>`,ok:"Cerrar",cancel:""});
   if(a==="ren"){const nn=await modal({title:"Renombrar",input:n,ok:"Guardar"});if(nn&&nn!==true&&nn!==n){const r=await call("rename_speaker",n,nn);if(r.ok){toast("Persona renombrada");init.gestionar()}}}
-  if(a==="re"&&await modal({title:"Re-entrenar",body:`Se grabarán ${CFG.pasos} muestras nuevas para <b>${esc(n)}</b>. Las actuales solo se reemplazan al completar.`,ok:"Continuar"})){W=null;await show("registro");beginWizard("reentrenar",n)}
+  if(a==="re"&&await modal({title:"Re-entrenar",body:`Se grabarán de ${esc(CFG.pasos)} a ${esc(CFG.max_muestras)} muestras nuevas para <b>${esc(n)}</b>. Las actuales solo se reemplazan al completar.`,ok:"Continuar"})){W=null;await show("registro");beginWizard("reentrenar",n)}
+  if(a==="add"){W=null;await show("registro");beginWizard("ampliar",n)}
   if(a==="del")deletePerson(p,init.gestionar)};
 
 /* ---------- análisis de voz ---------- */
@@ -156,9 +163,12 @@ $("#pt-run").onclick=async()=>{en("#pt-run",false);const st=[];let bad=0,warn=0;
 
 /* ---------- arranque + PIN ---------- */
 $$("[data-rec]").forEach(e=>e.innerHTML=recHTML());$$("[data-cat]").forEach(e=>e.innerHTML=catHTML());
-$$(".nav button").forEach(b=>b.onclick=()=>b.dataset.v==="salir"?doExit():show(b.dataset.v));
+$$(".nav button").forEach(b=>b.onclick=()=>b.dataset.v==="salir"?doExit():b.dataset.v==="bloquear"?doLock():show(b.dataset.v));
+function lockUI(msg){if(rec.on)liveStop();W=null;$$(".overlay:not(#lock)").forEach(o=>o.remove());$("#lock").hidden=false;$("#pin").value="";
+  $("#pinmsg").textContent=msg||"Introduce tu PIN";$("#pinmsg").className="status"+(msg?" warn-c":"");$("#pin").focus()}
+async function doLock(){await callq("logout");lockUI("Sesión bloqueada")}
 $("#pinform").onsubmit=async e=>{e.preventDefault();const r=await callq("login",$("#pin").value);$("#pin").value="";
-  if(r.ok){$("#lock").hidden=true;show("registro")}else{$("#pinmsg").textContent=r.error;$("#pinmsg").className="status err"}};
+  if(r.ok){$("#lock").hidden=true;W=null;show("registro")}else{$("#pinmsg").textContent=r.error;$("#pinmsg").className="status err"}};
 async function boot(){
   const c=await callq("get_config");if(c.ok)CFG=c.data;
   const a=await callq("auth_status");if(!a.ok)return;

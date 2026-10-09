@@ -12,9 +12,10 @@ Responsable de todo lo relacionado con el audio:
  5) Reproducir audio ya capturado, para que el usuario pueda verificarlo.
 """
 
-import datetime
 import io
 import time
+import uuid
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -68,7 +69,7 @@ def grabar_audio(duracion: int = None, samplerate: int = None) -> np.ndarray:
     return audio.flatten()
 
 
-def guardar_wav(audio: np.ndarray, nombre_base: str) -> str:
+def guardar_wav(audio: np.ndarray) -> str:
     """
     Guarda un array de audio como archivo .wav ENCRIPTADO dentro de
     data/audio/. El audio de voz es un dato biométrico, así que nunca se
@@ -76,17 +77,14 @@ def guardar_wav(audio: np.ndarray, nombre_base: str) -> str:
     un buffer), se encripta con Fernet y solo el resultado encriptado
     toca el disco, con extensión .wav.enc.
 
-    Args:
-        audio: señal de audio (numpy array).
-        nombre_base: prefijo del archivo (normalmente el nombre de la persona).
+    El nombre del archivo es un identificador aleatorio (uuid4): no revela
+    a quién pertenece la voz y no depende de ninguna entrada del usuario,
+    así que no puede usarse para escribir fuera de data/audio/.
 
     Returns:
         Ruta (str) del archivo .wav.enc creado.
     """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    nombre_seguro = "".join(c if c.isalnum() else "_" for c in nombre_base)
-    nombre_archivo = f"{nombre_seguro}_{timestamp}.wav.enc"
-    ruta = config.AUDIO_DIR / nombre_archivo
+    ruta = config.AUDIO_DIR / f"{uuid.uuid4().hex}.wav.enc"
 
     buffer = io.BytesIO()
     sf.write(buffer, audio, config.SAMPLE_RATE, format="WAV")
@@ -571,12 +569,13 @@ def reproducir_audio(audio: np.ndarray, samplerate: int = None) -> None:
         print(f"⚠️  No se pudo reproducir el audio: {e}")
 
 
-def cargar_audio_desde_archivo(ruta: str) -> np.ndarray:
+def cargar_audio_desde_archivo(ruta) -> np.ndarray:
     """
     Carga un archivo .wav.enc ya guardado en disco: lo desencripta en
     memoria y lo decodifica con librosa. Útil para pruebas/depuración.
+    La ruta debe venir de database.ruta_audio_segura (validada).
     """
-    datos_encriptados = open(ruta, "rb").read()
+    datos_encriptados = Path(ruta).read_bytes()
     datos_planos = security.desencriptar_bytes(datos_encriptados)
     audio, _ = librosa.load(io.BytesIO(datos_planos), sr=config.SAMPLE_RATE, mono=True)
     return audio

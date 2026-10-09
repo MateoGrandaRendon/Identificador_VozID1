@@ -2,7 +2,7 @@ sounddevice==0.4.7
 soundfile==0.12.1
 numpy==1.26.4
 librosa==0.10.2.post1
-SQLAlchemy==2.0.35
-python-dotenv==1.0.1
-cryptography==43.0.3
-pywebview>=5.0
+pymongo==4.18.3
+python-dotenv==1.2.4
+cryptography==50.0.2
+pywebview==6.2.1

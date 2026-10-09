@@ -7,15 +7,24 @@ reconocimiento de lo que dicen (eso sería speech-to-text).
 
 ```
 voice_identifier/
-├── main.py              # Punto de entrada: menú CLI, enrollment, identificación, pruebas
-├── config.py            # Configuración global (rutas y parámetros)
-├── database.py          # Capa de datos: SQLite + SQLAlchemy (Speaker, VoiceSample)
-├── audio_processor.py   # Captura de audio, extracción de embeddings, comparación
-├── requirements.txt     # Dependencias
-├── README.md
-└── data/                # Se crea automáticamente al ejecutar
-    ├── voice_id.db       # Base de datos SQLite
-    └── audio/            # Muestras .wav y embeddings .npy
+├── main.py                  # Menú CLI: registro, identificación, gestión, pruebas
+├── frontend/                # Interfaz gráfica de escritorio (pywebview)
+│   ├── app.py               #   arranque y endurecimiento de la ventana (CSP)
+│   ├── bridge.py            #   API expuesta a JavaScript (sesión, rate limiting, validación)
+│   └── web/                 #   index.html, styles.css, app.js
+├── config.py                # Configuración global (rutas, límites, parámetros)
+├── database.py              # Capa de datos: MongoDB (pymongo)
+├── registro.py              # Guardado de perfiles (reglas de 4 a 25 muestras)
+├── security.py              # PIN, bloqueo anti fuerza bruta, cifrado, validación, logs
+├── audio_processor.py       # Captura de audio, extracción de embeddings, comparación
+├── matching.py              # Lógica de decisión de identificación
+├── setup_seguridad.py       # Genera PIN y clave de cifrado en .env
+├── migrar_sqlite_a_mongo.py # Migración única desde la versión SQLite anterior
+├── requirements.txt         # Dependencias (versiones fijadas y auditadas)
+├── requirements-dev.txt     # + pytest, mongomock, pip-audit
+└── data/                    # Se crea automáticamente (fuera de git)
+    ├── audio/               #   audios .wav cifrados (nombres aleatorios)
+    └── logs/                #   voiceid.log (errores técnicos, sin datos personales)
 ```
 
 ## 2. Preparar el entorno en VS Code
@@ -28,6 +37,7 @@ Abre una terminal en VS Code (`Ctrl + ñ` / `Ctrl + \``) dentro de la carpeta
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+python setup_seguridad.py
 ```
 
 ### macOS / Linux
@@ -35,6 +45,7 @@ pip install -r requirements.txt
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python setup_seguridad.py
 ```
 
 En VS Code, selecciona el intérprete del entorno virtual: `Ctrl+Shift+P` →
@@ -50,51 +61,88 @@ PortAudio:
 - **macOS**: `brew install portaudio`
 - **Linux (Debian/Ubuntu)**: `sudo apt-get install portaudio19-dev`
 
-## 3. Ejecutar el programa
+### MongoDB (base de datos)
 
-Con el entorno virtual activado:
+La aplicación necesita un servidor MongoDB:
+
+- **Local**: instala *MongoDB Community Server* (https://www.mongodb.com/try/download/community)
+  como servicio de Windows. Escuchará en `127.0.0.1:27017`, que es el valor por defecto.
+- **Docker**: `docker run -d --name voiceid-mongo -p 127.0.0.1:27017:27017 mongo:7`
+- **Remoto (Atlas)**: pon la URI en `.env` como `VOICE_ID_MONGODB_URI=mongodb+srv://...`.
+  Una conexión remota sin TLS se rechaza.
+
+La configuración va en `.env` (ver `.env.example`); nunca en el código.
+
+Si tenías datos en la versión SQLite anterior, migra una sola vez:
 
 ```bash
-python main.py
+python migrar_sqlite_a_mongo.py --borrar-sqlite
 ```
 
-Aparecerá un menú:
+## 3. Ejecutar el programa
 
-```
-1) Registrar nueva persona (enrollment)
-2) Identificar una voz
-3) Listar personas registradas
-4) Ejecutar pruebas automáticas de verificación
-5) Salir
+```bash
+python -m frontend.app   # interfaz gráfica
+python main.py           # menú en terminal
 ```
 
-### Flujo recomendado la primera vez
+Cada persona debe tener **entre 4 y 25 muestras de voz**: el registro pide 4
+obligatorias y permite grabar más (opcionales) hasta 25. Desde *Gestionar
+personas* se pueden re-entrenar (reemplazar todas) o añadir muestras sin pasar
+del máximo. El límite se aplica en la interfaz, en `database.py` y en un
+validador `$jsonSchema` de la propia colección de MongoDB.
 
-1. Opción **4** — corre las pruebas automáticas para confirmar que el
-   micrófono, la base de datos y el modelo funcionan en tu máquina.
-2. Opción **1** — registra a una persona (te pedirá hablar 4 veces, 4
-   segundos cada vez).
-3. Opción **2** — habla de nuevo y verifica que el sistema te identifica
-   correctamente.
-4. Opción **3** — revisa el listado de personas y cuántas muestras tiene cada una.
+## 4. Modelo de datos (MongoDB)
 
-## 4. Notas técnicas (Fase 1)
+Colección `speakers`, un documento por persona con sus muestras embebidas
+(toda escritura es atómica sin necesitar transacciones):
 
-- **Embedding de voz**: se calcula con MFCC (`librosa`) + media/desviación
-  estándar, normalizado con norma L2. Es rápido y no requiere descargar
-  modelos pesados, ideal para validar el flujo completo. En una fase
-  posterior se puede sustituir por un modelo de deep learning
-  (por ejemplo, `resemblyzer` o SpeechBrain ECAPA-TDNN) cambiando solo la
-  función `extraer_embedding` en `audio_processor.py` — el resto del
-  sistema (base de datos, comparación, CLI) no necesita cambiar.
-- **Umbral de decisión**: `UMBRAL_SIMILITUD` en `config.py` (por defecto
-  0.80). Si el sistema identifica mal, prueba subiendo o bajando ese valor.
-- **Base de datos**: SQLite vía SQLAlchemy. El archivo vive en
-  `data/voice_id.db` y se puede abrir con cualquier visor de SQLite
-  (por ejemplo, la extensión "SQLite Viewer" de VS Code) para inspeccionar
-  las tablas `speakers` y `voice_samples`.
-- **Preparado para crecer**: la separación en módulos (`config`,
-  `database`, `audio_processor`, `main`) permite conectar después una
-  interfaz web (HTML/CSS/JS) que llame a estas mismas funciones desde una
-  API (por ejemplo con FastAPI o Flask), sin reescribir la lógica de
-  audio ni de base de datos.
+```json
+{
+  "nombre": "Ana María", "nombre_clave": "ana maría", "fecha_registro": "ISODate",
+  "muestras": [
+    {"archivo_audio": "<uuid>.wav.enc", "embedding": "BinData (cifrado)",
+     "version_embedding": 2, "dim": 156, "fecha_creacion": "ISODate"}
+  ]
+}
+```
+
+Colección `estado_seguridad`: contador de intentos fallidos de PIN y bloqueo.
+
+## 5. Seguridad
+
+| # | Riesgo | Medida |
+|---|--------|--------|
+| 1 | Inyección SQL / NoSQL | Sin SQL. Los filtros de MongoDB solo reciben `str` validados; un objeto como `{"$ne": ""}` se rechaza antes de llegar a la BD. |
+| 2 | Inyección de comandos | No se ejecutan comandos del sistema (`subprocess`, `os.system`, `eval`). |
+| 3 | XSS | Todo dato dinámico pasa por `esc()` o `textContent`; CSP con nonce: un `<script>` inyectado no se ejecuta. |
+| 4 | CSRF | No hay servidor HTTP ni cookies; la API solo existe dentro de la ventana. `form-action 'none'`. |
+| 5 | SSRF | La app no hace peticiones a URLs; la URI de MongoDB solo viene del `.env`. `connect-src 'none'`. |
+| 6 | Fallos de autenticación | PIN con PBKDF2-SHA256 (600 000 iteraciones), comparación en tiempo constante, PIN mínimo de 6 caracteres no trivial. |
+| 7, 8 | Autorización / escalada | Denegar por defecto: todo método exige sesión salvo 3 de solo lectura; los métodos internos son privados (`_`); los nombres que empiezan por `_` están reservados. |
+| 9, 21 | Exposición de información / trazas | Al usuario solo se muestran mensajes genéricos; los detalles van a `data/logs/voiceid.log`, sin nombres ni secretos. |
+| 10 | Credenciales en el código | PIN, clave y URI solo en `.env` (fuera de git, permisos 600). |
+| 11 | Sesiones | Se bloquea tras 10 min de inactividad o 8 h; botón «Bloquear sesión»; al bloquear se borran de memoria los audios pendientes. |
+| 12 | Almacenamiento de contraseñas | Solo sal + hash PBKDF2 en `.env`; nunca el PIN. |
+| 13 | Fuerza bruta | 3 fallos → bloqueo de 60 s, que se duplica en cada bloqueo seguido (máx. 1 h); se guarda en MongoDB, así que reiniciar no lo evita. |
+| 14, 29 | Rate limiting / DoS | Límite de llamadas por método; grabación con tope de 30 s en memoria; tiempos de espera en MongoDB; máx. 25 muestras por persona. |
+| 15, 16 | Archivos / Path Traversal | Nombres de archivo aleatorios generados por la app; se validan con un patrón y contra `data/audio` (también en el `$jsonSchema`). |
+| 17 | Permisos / configuración | Carpetas `data/` 700, `.env` 600, sin herramientas de desarrollo, sin acceso a `file://`, modo privado. |
+| 18 | Dependencias | Versiones fijadas; `pip-audit` sin vulnerabilidades conocidas. |
+| 19, 20, 26 | CORS / HTTPS / cabeceras | La página se carga en memoria: no se abre el servidor HTTP de pywebview. MongoDB remoto exige TLS con certificados válidos. |
+| 22 | Redirecciones | Si la ventana navega a una página externa, la sesión se bloquea y se recarga la app. |
+| 23 | Deserialización | `np.load(..., allow_pickle=False)`; datos cifrados y autenticados (Fernet/HMAC); sin `pickle`. |
+| 24, 25 | APIs / validación | Validación de tipo, formato y longitud de cada parámetro de la API JS. |
+| 27 | Clickjacking | La app es una ventana de escritorio; `frame-src 'none'` y bloqueo si se carga dentro de un marco. |
+| 28 | Copias y configuración | `.gitignore` excluye `.env*`, `*.db`, volcados, `*.bak`, logs; la migración ofrece borrar la base SQLite antigua. |
+| 30 | Datos personales | Audio y embeddings cifrados (AES-128 + HMAC); los nombres de archivo no revelan identidades; borrado completo al eliminar a una persona. |
+
+Ejecutar las pruebas: `pip install -r requirements-dev.txt` y luego `python -m pytest test`.
+Auditar dependencias: `pip-audit -r requirements.txt`.
+
+## 6. Notas técnicas
+
+- **Embedding de voz**: MFCC + deltas, F0, formantes (LPC), energía,
+  contraste espectral, ZCR y ritmo (`audio_processor.extraer_embedding`).
+- **Umbrales de decisión**: `UMBRAL_SIMILITUD` y
+  `UMBRAL_DISTANCIA_EUCLIDIANA` en `config.py`.

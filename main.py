@@ -18,6 +18,7 @@ virtual activado):
     python main.py
 """
 
+import logging
 import sys
 import random
 import numpy as np
@@ -26,7 +27,10 @@ import config
 import database as db
 import audio_processor as ap
 import matching
+import registro
 import security
+
+log = logging.getLogger("voiceid.cli")
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +51,7 @@ def _duracion_para_texto(texto: str) -> int:
 # Captura de UNA muestra con texto guiado + cuenta regresiva + barra en vivo
 # + validación (calidad/SNR) + reproducción de verificación + reintento
 # ---------------------------------------------------------------------------
-def _capturar_muestra_valida(nombre: str, paso: int, total_pasos: int, texto_lectura: str):
+def _capturar_muestra_valida(paso: int, etiqueta: str, texto_lectura: str):
     """
     Graba UNA muestra (un "paso" del registro/re-entrenamiento guiado):
     muestra el texto a leer, cuenta regresiva 3-2-1, graba con la barra de
@@ -59,14 +63,13 @@ def _capturar_muestra_valida(nombre: str, paso: int, total_pasos: int, texto_lec
     queda conforme al escucharla, se ofrece reintentar EN ESTE MISMO PASO —
     nunca se reinician los pasos ya completados ni se vuelve al menú.
 
-    Devuelve (ruta_audio, embedding), o None si el usuario decide cancelar
-    el reintento (las muestras de pasos anteriores, ya guardadas, se
-    conservan tal cual).
+    Devuelve el audio (np.ndarray) o None si el usuario cancela. No guarda
+    nada: el perfil se persiste completo al final (registro.guardar_perfil).
     """
     duracion = _duracion_para_texto(texto_lectura)
 
     while True:
-        print(f"\n--- Paso {paso}/{total_pasos} ---")
+        print(f"\n--- Muestra {paso} ({etiqueta}) ---")
         print(f"📖 Lee en voz alta el siguiente texto (tendrás {duracion}s, sin prisa):\n   \"{texto_lectura}\"")
         input("\nPresiona ENTER cuando estés listo...")
         ap.cuenta_regresiva()
@@ -88,53 +91,82 @@ def _capturar_muestra_valida(nombre: str, paso: int, total_pasos: int, texto_lec
         if conservar != "s":
             continue  # vuelve a grabar el mismo paso, sin afectar los anteriores
 
-        ruta_audio = ap.guardar_wav(audio, nombre_base=nombre)
-        embedding = ap.extraer_embedding(audio)
-        return ruta_audio, embedding
+        return audio
+
+
+def _pedir_nombre(mensaje: str):
+    """Pide y valida un nombre de persona. Devuelve None si no es válido."""
+    try:
+        return security.validar_nombre_persona(input(mensaje))
+    except ValueError as e:
+        print(f"❌ {e}")
+        return None
+
+
+def _grabar_muestras(minimo: int, maximo: int):
+    """
+    Graba entre `minimo` (obligatorias) y `maximo` muestras: tras las
+    obligatorias, pregunta si se quieren añadir más (hasta el máximo).
+    Devuelve la lista de audios, o None si se cancela antes del mínimo.
+    """
+    audios = []
+    while len(audios) < maximo:
+        paso = len(audios) + 1
+        if paso > minimo:
+            otra = input(
+                f"\n¿Grabar otra muestra opcional? ({len(audios)} de máx. {maximo}) (s/n): "
+            ).strip().lower()
+            if otra != "s":
+                break
+        texto = config.TEXTOS_LECTURA_REGISTRO[(paso - 1) % len(config.TEXTOS_LECTURA_REGISTRO)]
+        etiqueta = f"obligatoria {paso}/{minimo}" if paso <= minimo else f"opcional, máx. {maximo}"
+        audio = _capturar_muestra_valida(paso, etiqueta, texto)
+        if audio is None:
+            if len(audios) < minimo:
+                return None
+            break
+        audios.append(audio)
+    return audios
+
+
+def _guardar_perfil_cli(nombre: str, audios, modo: str) -> None:
+    print("\n⚙️  Procesando y guardando (extrayendo embeddings)...")
+    try:
+        n = registro.guardar_perfil(nombre, audios, modo)
+    except db.BaseDatosError as e:
+        print(f"❌ {e}")
+        return
+    print(f"✅ {n} muestra(s) guardada(s) para '{nombre}'.")
 
 
 # ---------------------------------------------------------------------------
-# OPCIÓN 1: Registro guiado (enrollment) de una nueva persona — 4 pasos fijos
+# OPCIÓN 1: Registro guiado (enrollment) de una nueva persona — 4 a 25 muestras
 # ---------------------------------------------------------------------------
 def registrar_persona() -> None:
-    nombre = input("Nombre de la persona a registrar: ").strip()
-    if not nombre:
-        print("❌ El nombre no puede estar vacío.")
+    nombre = _pedir_nombre("Nombre de la persona a registrar: ")
+    if nombre is None:
+        return
+    if db.obtener_speaker(nombre) is not None:
+        print(f"❌ '{nombre}' ya existe. Usa 'Gestionar personas' para re-entrenar o añadir muestras.")
         return
 
-    session = db.SessionLocal()
-    try:
-        speaker = db.obtener_o_crear_speaker(session, nombre)
-
-        print(f"\nRegistro guiado: {config.NUM_PASOS_REGISTRO} pasos, cada uno con un texto distinto para leer.")
-        for paso in range(1, config.NUM_PASOS_REGISTRO + 1):
-            texto = config.TEXTOS_LECTURA_REGISTRO[(paso - 1) % len(config.TEXTOS_LECTURA_REGISTRO)]
-            resultado = _capturar_muestra_valida(nombre, paso, config.NUM_PASOS_REGISTRO, texto)
-            if resultado is None:
-                print(
-                    f"\n⏹️  Registro detenido en el paso {paso}/{config.NUM_PASOS_REGISTRO}. "
-                    f"Las muestras ya guardadas de '{nombre}' se conservan."
-                )
-                return
-
-            ruta_audio, embedding = resultado
-            db.guardar_muestra(session, speaker, ruta_audio, embedding)
-            print(f"   ✅ Paso {paso}/{config.NUM_PASOS_REGISTRO} guardado en: {ruta_audio}")
-
-        print(f"\n✅ Registro completo para '{nombre}' ({config.NUM_PASOS_REGISTRO} muestras).")
-    finally:
-        session.close()
+    minimo, maximo = registro.limites_nuevas_muestras("registro")
+    print(
+        f"\nRegistro guiado: {minimo} muestras obligatorias (cada una con un texto distinto) "
+        f"y, si quieres, más muestras opcionales hasta {maximo}. No se guarda nada hasta el final."
+    )
+    audios = _grabar_muestras(minimo, maximo)
+    if audios is None:
+        print(f"\n⏹️  Registro cancelado: no se guardó nada (se necesitan al menos {minimo} muestras).")
+        return
+    _guardar_perfil_cli(nombre, audios, "registro")
 
 
 # ---------------------------------------------------------------------------
 # OPCIÓN 2: Identificación de una voz nueva contra los perfiles guardados
 # ---------------------------------------------------------------------------
 def identificar_persona() -> None:
-    session = db.SessionLocal()
-    try:
-        perfiles_todos = db.obtener_embeddings_todos(session)
-    finally:
-        session.close()
+    perfiles_todos = db.obtener_embeddings_todos()
 
     if not perfiles_todos:
         print("⚠️  No hay personas registradas todavía. Usa la opción 1 primero.")
@@ -201,37 +233,29 @@ def identificar_persona() -> None:
 # OPCIÓN 3: Listado de personas registradas
 # ---------------------------------------------------------------------------
 def listar_personas() -> None:
-    session = db.SessionLocal()
-    try:
-        speakers = db.listar_speakers(session)
-        if not speakers:
-            print("⚠️  No hay personas registradas.")
-            return
+    personas = db.listar_speakers()
+    if not personas:
+        print("⚠️  No hay personas registradas.")
+        return
 
-        # Diagnóstico por persona: cuántas de sus muestras son compatibles
-        # con la versión/dimensión VIGENTE del motor (config.EMBEDDING_VERSION
-        # / config.EMBEDDING_DIM). Sin esto, una persona "registrada" podía
-        # nunca ser reconocida sin que el usuario entendiera por qué — el
-        # filtro de identificar_persona la excluía en silencio.
-        diagnostico = {d["nombre"]: d for d in db.diagnostico_embeddings(session)}
-
-        print("\nPersonas registradas:")
-        for s in speakers:
-            info = diagnostico.get(s.nombre, {})
-            estado = ""
-            if info.get("necesita_reentrenar"):
-                estado = "  ⚠️  DESACTUALIZADA (re-entrenar antes de poder identificarse)"
-            elif info.get("muestras_compatibles", 0) < info.get("total_muestras", 0):
-                estado = (
-                    f"  ⚠️  {info['total_muestras'] - info['muestras_compatibles']} "
-                    "muestra(s) obsoleta(s) mezclada(s) con muestras vigentes"
-                )
-            print(
-                f"  - {s.nombre}  (id={s.id}, muestras={len(s.muestras)}, "
-                f"desde={s.fecha_registro:%Y-%m-%d %H:%M}){estado}"
+    # Diagnóstico por persona: cuántas de sus muestras son compatibles con
+    # la versión/dimensión VIGENTE del motor. Sin esto, una persona
+    # "registrada" podía nunca ser reconocida sin que el usuario entendiera
+    # por qué — el filtro de identificar_persona la excluía en silencio.
+    print("\nPersonas registradas:")
+    for p in personas:
+        estado = ""
+        if p["necesita_reentrenar"]:
+            estado = "  ⚠️  DESACTUALIZADA (re-entrenar antes de poder identificarse)"
+        elif p["muestras_compatibles"] < p["total_muestras"]:
+            estado = (
+                f"  ⚠️  {p['total_muestras'] - p['muestras_compatibles']} "
+                "muestra(s) obsoleta(s) mezclada(s) con muestras vigentes"
             )
-    finally:
-        session.close()
+        print(
+            f"  - {p['nombre']}  (muestras={p['total_muestras']}/{config.MAX_MUESTRAS_POR_PERSONA}, "
+            f"desde={p['fecha_registro']:%Y-%m-%d %H:%M}){estado}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -295,18 +319,14 @@ def analizar_modulacion_voz() -> None:
 # OPCIÓN 6 (NUEVA): GESTIONAR PERSONAS REGISTRADAS (CRUD)
 # ---------------------------------------------------------------------------
 def _renombrar_persona_flujo() -> None:
-    nombre_actual = input("\nNombre actual de la persona: ").strip()
-    nombre_nuevo = input("Nuevo nombre: ").strip()
-    if not nombre_actual or not nombre_nuevo:
-        print("❌ Ambos nombres son obligatorios.")
+    nombre_actual = _pedir_nombre("\nNombre actual de la persona: ")
+    if nombre_actual is None:
+        return
+    nombre_nuevo = _pedir_nombre("Nuevo nombre: ")
+    if nombre_nuevo is None:
         return
 
-    session = db.SessionLocal()
-    try:
-        resultado = db.renombrar_speaker(session, nombre_actual, nombre_nuevo)
-    finally:
-        session.close()
-
+    resultado = db.renombrar_speaker(nombre_actual, nombre_nuevo)
     if resultado == "ok":
         print(f"✅ '{nombre_actual}' ahora se llama '{nombre_nuevo}'.")
     elif resultado == "no_existe":
@@ -317,62 +337,65 @@ def _renombrar_persona_flujo() -> None:
 
 def _reentrenar_persona_flujo() -> None:
     """
-    Borra las muestras de voz actuales de una persona (audio + embedding,
-    en BD y en disco) y graba muestras nuevas en su lugar, con el mismo
-    registro guiado de 4 pasos (textos + validación) que el registro
-    inicial. El Speaker (su identidad/nombre) no se toca, solo su
-    "huella de voz".
+    Graba un juego nuevo de muestras (4 a 25) y, SOLO al completarlo,
+    reemplaza atómicamente las anteriores (BD y disco). Si se cancela a
+    mitad, la persona conserva sus muestras actuales intactas.
     """
-    nombre = input("\nNombre de la persona a re-entrenar: ").strip()
-    if not nombre:
-        print("❌ El nombre no puede estar vacío.")
+    nombre = _pedir_nombre("\nNombre de la persona a re-entrenar: ")
+    if nombre is None:
+        return
+    speaker = db.obtener_speaker(nombre)
+    if speaker is None:
+        print(f"⚠️  No se encontró a '{nombre}'.")
         return
 
-    session = db.SessionLocal()
-    try:
-        speaker = session.query(db.Speaker).filter_by(nombre=nombre).first()
-        if speaker is None:
-            print(f"⚠️  No se encontró a '{nombre}'.")
-            return
+    minimo, maximo = registro.limites_nuevas_muestras("reentrenar")
+    confirmar = input(
+        f"Se grabarán de {minimo} a {maximo} muestras nuevas que reemplazarán las "
+        f"{len(speaker['muestras'])} actuales de '{speaker['nombre']}' al terminar. ¿Continuar? (s/n): "
+    ).strip().lower()
+    if confirmar != "s":
+        print("Cancelado.")
+        return
 
-        confirmar = input(
-            f"Esto borrará las {len(speaker.muestras)} muestra(s) de voz actuales de "
-            f"'{nombre}' y grabará {config.NUM_PASOS_REGISTRO} muestras nuevas (registro guiado). "
-            f"¿Continuar? (s/n): "
-        ).strip().lower()
-        if confirmar != "s":
-            print("Cancelado.")
-            return
+    audios = _grabar_muestras(minimo, maximo)
+    if audios is None:
+        print("\n⏹️  Re-entrenamiento cancelado: se conservan las muestras anteriores.")
+        return
+    _guardar_perfil_cli(speaker["nombre"], audios, "reentrenar")
 
-        borradas = db.eliminar_muestras_speaker(session, speaker)
-        print(f"🗑️  {borradas} muestra(s) anterior(es) eliminada(s) de la BD y del disco.")
 
-        for paso in range(1, config.NUM_PASOS_REGISTRO + 1):
-            texto = config.TEXTOS_LECTURA_REGISTRO[(paso - 1) % len(config.TEXTOS_LECTURA_REGISTRO)]
-            resultado = _capturar_muestra_valida(nombre, paso, config.NUM_PASOS_REGISTRO, texto)
-            if resultado is None:
-                print(f"\n⏹️  Re-entrenamiento detenido en el paso {paso}/{config.NUM_PASOS_REGISTRO}.")
-                return
+def _ampliar_persona_flujo() -> None:
+    """Añade muestras a una persona existente sin superar el máximo por persona."""
+    nombre = _pedir_nombre("\nNombre de la persona a la que añadir muestras: ")
+    if nombre is None:
+        return
+    speaker = db.obtener_speaker(nombre)
+    if speaker is None:
+        print(f"⚠️  No se encontró a '{nombre}'.")
+        return
 
-            ruta_audio, embedding = resultado
-            db.guardar_muestra(session, speaker, ruta_audio, embedding)
-            print(f"   ✅ Paso {paso}/{config.NUM_PASOS_REGISTRO} guardado en: {ruta_audio}")
+    minimo, maximo = registro.limites_nuevas_muestras("ampliar", len(speaker["muestras"]))
+    if maximo == 0:
+        print(f"⚠️  '{speaker['nombre']}' ya tiene el máximo de {config.MAX_MUESTRAS_POR_PERSONA} muestras.")
+        return
+    print(f"'{speaker['nombre']}' tiene {len(speaker['muestras'])} muestra(s); puedes añadir hasta {maximo}.")
 
-        print(f"\n✅ Re-entrenamiento completo para '{nombre}'.")
-    finally:
-        session.close()
+    audios = _grabar_muestras(minimo, maximo)
+    if not audios:
+        print("Cancelado.")
+        return
+    _guardar_perfil_cli(speaker["nombre"], audios, "ampliar")
 
 
 def _eliminar_persona_flujo() -> None:
     """
     Elimina a una persona por completo: de la base de datos Y de los
-    archivos de audio/embedding en disco, con una transacción SQL directa
-    y ligera (ver database.eliminar_speaker_completo). Pide confirmación
-    escribiendo el nombre de nuevo, para evitar borrados accidentales.
+    archivos de audio en disco (ver database.eliminar_speaker_completo).
+    Pide confirmación escribiendo el nombre de nuevo.
     """
-    nombre = input("\nNombre exacto de la persona a eliminar: ").strip()
-    if not nombre:
-        print("❌ El nombre no puede estar vacío.")
+    nombre = _pedir_nombre("\nNombre exacto de la persona a eliminar: ")
+    if nombre is None:
         return
 
     confirmacion = input(f"Escribe '{nombre}' de nuevo para confirmar el borrado: ").strip()
@@ -395,46 +418,44 @@ def _reproducir_audios_flujo() -> None:
     disco), para verificar físicamente que se grabaron completas y
     correctamente.
     """
-    session = db.SessionLocal()
-    try:
-        speakers = db.listar_speakers(session)
-        if not speakers:
-            print("⚠️  No hay personas registradas.")
-            return
+    personas = db.listar_speakers()
+    if not personas:
+        print("⚠️  No hay personas registradas.")
+        return
 
-        print("\nPersonas registradas:")
-        for i, s in enumerate(speakers, start=1):
-            print(f"  {i}) {s.nombre} ({len(s.muestras)} muestra(s))")
+    print("\nPersonas registradas:")
+    for i, p in enumerate(personas, start=1):
+        print(f"  {i}) {p['nombre']} ({p['total_muestras']} muestra(s))")
 
-        seleccion = input("\nNúmero de la persona a escuchar (ENTER para cancelar): ").strip()
-        if not seleccion.isdigit() or not (1 <= int(seleccion) <= len(speakers)):
-            print("Cancelado.")
-            return
+    seleccion = input("\nNúmero de la persona a escuchar (ENTER para cancelar): ").strip()
+    if not seleccion.isdigit() or not (1 <= int(seleccion) <= len(personas)):
+        print("Cancelado.")
+        return
 
-        speaker = speakers[int(seleccion) - 1]
-        if not speaker.muestras:
-            print(f"⚠️  '{speaker.nombre}' no tiene muestras guardadas.")
-            return
+    speaker = db.obtener_speaker(personas[int(seleccion) - 1]["nombre"])
+    if speaker is None or not speaker["muestras"]:
+        print("⚠️  Esa persona no tiene muestras guardadas.")
+        return
 
-        for i, muestra in enumerate(speaker.muestras, start=1):
-            respuesta = input(
-                f"\nMuestra {i}/{len(speaker.muestras)} de '{speaker.nombre}' "
-                f"(grabada el {muestra.fecha_creacion:%Y-%m-%d %H:%M}). "
-                "¿Reproducir? (s/n, o 'salir' para terminar): "
-            ).strip().lower()
-            if respuesta == "salir":
-                break
-            if respuesta != "s":
-                continue
-            try:
-                audio = ap.cargar_audio_desde_archivo(muestra.ruta_audio)
-                ap.reproducir_audio(audio)
-            except FileNotFoundError:
-                print("⚠️  El archivo de audio ya no existe en disco.")
-            except Exception as e:
-                print(f"⚠️  No se pudo reproducir: {e}")
-    finally:
-        session.close()
+    total = len(speaker["muestras"])
+    for i, muestra in enumerate(speaker["muestras"], start=1):
+        respuesta = input(
+            f"\nMuestra {i}/{total} de '{speaker['nombre']}' "
+            f"(grabada el {muestra['fecha_creacion']:%Y-%m-%d %H:%M}). "
+            "¿Reproducir? (s/n, o 'salir' para terminar): "
+        ).strip().lower()
+        if respuesta == "salir":
+            break
+        if respuesta != "s":
+            continue
+        try:
+            audio = ap.cargar_audio_desde_archivo(db.ruta_audio_segura(muestra["archivo_audio"]))
+            ap.reproducir_audio(audio)
+        except FileNotFoundError:
+            print("⚠️  El archivo de audio ya no existe en disco.")
+        except Exception:
+            log.exception("Fallo al reproducir una muestra")
+            print("⚠️  No se pudo reproducir la muestra.")
 
 
 def gestionar_personas() -> None:
@@ -446,8 +467,9 @@ def gestionar_personas() -> None:
         print("1) Ver personas registradas")
         print("2) Renombrar una persona")
         print("3) Re-entrenar (reemplazar sus muestras de voz)")
-        print("4) Reproducir audios guardados (verificar grabaciones)")
-        print("5) Volver al menú principal")
+        print(f"4) Añadir muestras (hasta {config.MAX_MUESTRAS_POR_PERSONA} por persona)")
+        print("5) Reproducir audios guardados (verificar grabaciones)")
+        print("6) Volver al menú principal")
         opcion = input("\nSelecciona una opción: ").strip()
 
         if opcion == "1":
@@ -457,11 +479,27 @@ def gestionar_personas() -> None:
         elif opcion == "3":
             _reentrenar_persona_flujo()
         elif opcion == "4":
-            _reproducir_audios_flujo()
+            _ampliar_persona_flujo()
         elif opcion == "5":
+            _reproducir_audios_flujo()
+        elif opcion == "6":
             return
         else:
             print("❌ Opción no válida, intenta de nuevo.")
+
+
+NOMBRE_PRUEBA = "_usuario_prueba_"
+
+
+def probar_base_datos(audio) -> bool:
+    """Escribe un perfil de prueba (con el mínimo de muestras), lo relee y lo elimina."""
+    db.init_db()
+    db.eliminar_speaker_completo(NOMBRE_PRUEBA)  # restos de una prueba interrumpida
+    try:
+        registro.guardar_perfil(NOMBRE_PRUEBA, [audio] * config.MIN_MUESTRAS_POR_PERSONA, "registro")
+        return any(nombre == NOMBRE_PRUEBA for nombre, _, _ in db.obtener_embeddings_todos())
+    finally:
+        db.eliminar_speaker_completo(NOMBRE_PRUEBA)
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +513,9 @@ def ejecutar_pruebas_automaticas() -> None:
         3) Modelo/embedding: ¿se puede procesar la muestra y comparar
            correctamente (similitud consigo misma ≈ 1.0)?
 
-    El registro '_usuario_prueba_' creado aquí es solo para diagnóstico y
-    puede borrarse luego sin afectar a las personas reales registradas.
+    El registro '_usuario_prueba_' creado aquí se borra al terminar. Los
+    nombres que empiezan por '_' están reservados: el validador de nombres
+    no permite que una persona real se llame así.
     """
     print("\n" + "=" * 60)
     print("🔍 EJECUTANDO PRUEBAS DE VERIFICACIÓN AUTOMÁTICAS")
@@ -503,26 +542,14 @@ def ejecutar_pruebas_automaticas() -> None:
     # --- Test 2: Base de datos ---
     print("\n[2/3] Probando conexión, escritura y lectura en la base de datos...")
     try:
-        db.init_db()
-        session = db.SessionLocal()
-        try:
-            speaker_prueba = db.obtener_o_crear_speaker(session, "_usuario_prueba_")
-            ruta_wav = ap.guardar_wav(audio_test, nombre_base="_prueba_")
-            embedding_prueba = ap.extraer_embedding(audio_test)
-            db.guardar_muestra(session, speaker_prueba, ruta_wav, embedding_prueba)
-
-            # Se relee desde la BD para confirmar que la persistencia fue real
-            perfiles = db.obtener_embeddings_todos(session)
-        finally:
-            session.close()
-
-        if any(nombre == "_usuario_prueba_" for nombre, _, _ in perfiles):
-            print(f"   ✅ Base de datos OK. Registro de prueba guardado en: {config.DB_PATH}")
+        if probar_base_datos(audio_test):
+            print("   ✅ Base de datos OK. Registro de prueba escrito, releído y eliminado en MongoDB.")
         else:
             raise RuntimeError("El registro de prueba no se encontró después de guardarlo.")
-    except Exception as e:
-        errores.append(f"Base de datos: {e}")
-        print(f"   ❌ Error de base de datos: {e}")
+    except Exception:
+        log.exception("Prueba de base de datos fallida")
+        errores.append("Base de datos: no se pudo escribir/leer (detalles en data/logs/voiceid.log)")
+        print("   ❌ Error de base de datos (detalles en data/logs/voiceid.log)")
 
     # --- Test 3: Extracción de embedding y comparación (modelo) ---
     print("\n[3/3] Probando extracción de embedding y comparación...")
@@ -585,10 +612,30 @@ def menu() -> None:
             print("❌ Opción no válida, intenta de nuevo.")
 
 
-if __name__ == "__main__":
-    db.init_db()
+def _arrancar() -> None:
+    security.configurar_logs()
+    try:
+        db.init_db()
+    except db.BaseDatosError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
     if not security.pedir_acceso():
         sys.exit(1)
     print("⚙️  Preparando el motor de voz (una sola vez, esto puede tardar unos segundos)...")
     ap.precalentar_motor()
-    menu()
+    try:
+        menu()
+    except KeyboardInterrupt:
+        print("\nHasta luego 👋")
+    except db.BaseDatosError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+    except Exception:
+        # Nunca se muestra la traza interna al usuario: queda en el log.
+        log.exception("Error inesperado en el CLI")
+        print("❌ Error inesperado. Los detalles técnicos se guardaron en data/logs/voiceid.log")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    _arrancar()
