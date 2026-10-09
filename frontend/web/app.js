@@ -85,7 +85,7 @@ function renderWizard(i){W=i;$("#reg-setup").hidden=true;$("#reg-run").hidden=fa
 async function beginWizard(modo,nombre){const r=await call("wizard_start",nombre,modo);if(r.ok)renderWizard(r.data)}
 init.registro=()=>{if(!W){$("#reg-setup").hidden=false;$("#reg-run").hidden=true;$("#reg-name").value="";$("#reg-count").textContent=""}};
 $("#reg-begin").onclick=()=>beginWizard("registro",$("#reg-name").value);
-$("#reg-name").onkeydown=e=>e.key==="Enter"&&$("#reg-begin").click();
+$("#reg-name").onkeydown=e=>{if(e.key==="Enter")$("#reg-begin").click()};
 $("#reg-start").onclick=async()=>{const r=await call("record_start");if(!r.ok)return;$("#reg-result").innerHTML="";en("#reg-start",false);en("#reg-stop",true);liveStart($("#reg-rec"),{max:W.duracion,onLimit:regStop})};
 async function regStop(){if(!rec.on)return;liveStop();en("#reg-stop",false);const r=await call("record_stop");en("#reg-start",true);if(!r.ok)return;
   $("#reg-result").innerHTML=r.data.valida
