@@ -95,6 +95,49 @@ def test_argumentos_de_mas_no_rompen_el_puente(sesion):
     assert r["ok"] is False and r["code"] == "invalid"
 
 
+def test_type_error_interno_no_se_confunde_con_solicitud_invalida(sesion, monkeypatch):
+    def falla():
+        raise TypeError("bug interno")
+    monkeypatch.setattr(bridge.db, "listar_speakers", falla)
+    assert sesion.list_speakers()["code"] == "backend_error"
+
+
+def test_doble_inicio_de_grabacion_no_abre_dos_streams(monkeypatch):
+    abiertos = []
+
+    class StreamFalso:
+        def __init__(self, **kw):
+            abiertos.append(self)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bridge.sd, "InputStream", StreamFalso)
+    rec = bridge._Recorder()
+    rec.start()
+    with pytest.raises(bridge.ApiError):
+        rec.start()
+    assert len(abiertos) == 1 and rec.active
+    rec.stop()
+    assert not rec.active
+
+
+def test_microfono_no_disponible_libera_la_reserva(monkeypatch):
+    def falla(**kw):
+        raise OSError("sin micrófono")
+    monkeypatch.setattr(bridge.sd, "InputStream", falla)
+    rec = bridge._Recorder()
+    with pytest.raises(bridge.ApiError):
+        rec.start()
+    assert rec.active is False
+
+
 def test_error_interno_no_expone_detalles(sesion, monkeypatch):
     def falla():
         raise RuntimeError("mongodb://admin:secreto@10.0.0.5 C:\\ruta\\interna")

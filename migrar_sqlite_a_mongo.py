@@ -41,7 +41,7 @@ def _fecha(valor) -> datetime.datetime:
     try:
         f = datetime.datetime.fromisoformat(str(valor))
     except ValueError:
-        f = datetime.datetime.now()
+        return datetime.datetime.now(datetime.timezone.utc)
     return f.replace(tzinfo=datetime.timezone.utc) if f.tzinfo is None else f
 
 
@@ -63,7 +63,7 @@ def migrar(borrar_sqlite: bool) -> None:
             (sp["id"],),
         ).fetchall()[: config.MAX_MUESTRAS_POR_PERSONA]
 
-        muestras, renombres = [], []
+        muestras, renombres, embeddings_persona = [], [], []
         for f in filas:
             audio, emb = _ruta_legada(f["ruta_audio"]), _ruta_legada(f["ruta_embedding"])
             if audio is None or emb is None:
@@ -74,7 +74,7 @@ def migrar(borrar_sqlite: bool) -> None:
                 continue
             nuevo = f"{uuid.uuid4().hex}.wav.enc"
             renombres.append((audio, config.AUDIO_DIR / nuevo))
-            embeddings_viejos.append(emb)
+            embeddings_persona.append(emb)
             muestras.append({
                 "archivo_audio": nuevo,
                 "embedding": Binary(emb.read_bytes()),  # ya está cifrado con la misma clave
@@ -98,6 +98,8 @@ def migrar(borrar_sqlite: bool) -> None:
             continue
         for viejo, nuevo in renombres:
             viejo.rename(nuevo)
+        # Solo los embeddings de personas migradas: los de las omitidas se conservan.
+        embeddings_viejos.extend(embeddings_persona)
         migradas += 1
 
     con.close()

@@ -439,11 +439,9 @@ def extraer_embedding(audio: np.ndarray, samplerate: int = None) -> np.ndarray:
 
 def distancia_euclidiana(a: np.ndarray, b: np.ndarray) -> float:
     """
-    Distancia euclidiana entre dos embeddings. Se usa como SEGUNDA métrica,
-    junto a la similitud coseno, en el motor de comparación estricto: una
-    identificación solo se acepta si ambas métricas coinciden en que las
-    voces son cercanas — exigir dos criterios distintos reduce los falsos
-    positivos que una sola métrica, por separado, podría dejar pasar.
+    Distancia euclidiana entre dos embeddings. Se muestra como dato
+    informativo junto a la similitud coseno; la decisión de identificación
+    la toma solo la similitud (ver matching.identificar_mejor_candidato).
 
     Blindaje defensivo: si a y b tienen dimensiones distintas (típicamente
     porque uno se generó con una versión anterior del pipeline de

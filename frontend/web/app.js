@@ -113,7 +113,7 @@ async function idStop(){if(!rec.on)return;liveStop();en("#id-stop",false);idStat
   const q=await call("identify_run");en("#id-start",true);if(!q.ok)return idStatus(q.error,"err");idStatus("");const d=q.data;
   $("#id-result").innerHTML=d.identificado
     ?`<h3>Resultado de identificación</h3><p>Persona identificada:</p><div class="big">${esc(d.nombre)}</div><p>Confianza: <b class="ok-c">${(d.similitud*100).toFixed(1)}%</b> · distancia ${d.distancia.toFixed(3)}</p>${d.vivacidad_baja?`<p class="warn-c">⚠ Vivacidad baja: heurística informativa, verifica en persona.</p>`:""}`
-    :`<h3>Resultado de identificación</h3><p class="fail"><b>No se reconoce ninguna voz registrada</b></p><p class="muted">Mejor candidato (no aceptado): ${esc(d.nombre)} · similitud ${(d.similitud*100).toFixed(1)}% (umbral ${(d.umbral_sim*100).toFixed(0)}%) · distancia ${d.distancia==null?"—":d.distancia.toFixed(3)} (máx ${d.umbral_dist})</p>`}
+    :`<h3>Resultado de identificación</h3><p class="fail"><b>No se reconoce ninguna voz registrada</b></p><p class="muted">Mejor candidato (no aceptado): ${esc(d.nombre)} · similitud ${(d.similitud*100).toFixed(1)}% (umbral ${(d.umbral_sim*100).toFixed(1)}%) · distancia ${d.distancia==null?"—":d.distancia.toFixed(3)}</p>`}
 $("#id-stop").onclick=idStop;
 
 /* ---------- personas: eliminar / gestionar ---------- */

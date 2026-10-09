@@ -26,6 +26,7 @@ las funciones de análisis del backend. Todo método devuelve {ok, data, error, 
 """
 import collections
 import functools
+import inspect
 import logging
 import math
 import random
@@ -90,6 +91,8 @@ class _Limitador:
 
 
 def _safe(fn):
+    firma = inspect.signature(fn)
+
     @functools.wraps(fn)
     def wrapper(self, *a, **k):
         nombre = fn.__name__
@@ -100,15 +103,19 @@ def _safe(fn):
             if motivo:
                 return {"ok": False, "data": None, "error": motivo, "code": "auth"}
             self._ultima_actividad = time.monotonic()
+        # Llamada desde JS con argumentos de más/de menos: se detecta ANTES de ejecutar, para
+        # no confundirla con un TypeError interno (que es un bug y va como backend_error).
+        try:
+            firma.bind(self, *a, **k)
+        except TypeError:
+            log.warning("Llamada con argumentos inválidos a %s", nombre)
+            return {"ok": False, "data": None, "error": "Solicitud inválida.", "code": "invalid"}
         try:
             return {"ok": True, "data": fn(self, *a, **k), "error": None, "code": None}
         except ApiError as e:
             return {"ok": False, "data": None, "error": str(e), "code": e.code}
         except db.BaseDatosError as e:   # mensajes ya redactados para el usuario
             return {"ok": False, "data": None, "error": str(e), "code": "db"}
-        except TypeError:                # llamada desde JS con argumentos de más/de menos
-            log.exception("Llamada con argumentos inválidos a %s", nombre)
-            return {"ok": False, "data": None, "error": "Solicitud inválida.", "code": "invalid"}
         except Exception:  # nunca dejar que una excepción rompa el puente ni exponer trazas
             log.exception("Error no controlado en %s", nombre)
             return {"ok": False, "data": None, "error": _MENSAJE_INTERNO, "code": "backend_error"}
@@ -155,10 +162,13 @@ class _Recorder:
                     self.f0s.append(self.f0)
 
     def start(self):
-        if self.active:
-            raise ApiError("Ya hay una grabación en curso.", "busy")
+        # Comprobar y reservar bajo el mismo lock: pywebview atiende cada llamada de JS en
+        # su propio hilo, y dos "Iniciar" seguidos no deben abrir dos streams.
         with self._lock:
+            if self.active:
+                raise ApiError("Ya hay una grabación en curso.", "busy")
             self._reset()
+            self.active, self.t0 = True, time.time()
         try:
             self._stream = sd.InputStream(
                 samplerate=config.SAMPLE_RATE, channels=config.CHANNELS, dtype="float32",
@@ -167,9 +177,9 @@ class _Recorder:
             self._stream.start()
         except Exception:
             self._stream = None
+            self.active = False
             log.exception("No se pudo abrir el micrófono")
             raise ApiError("Micrófono no disponible. Revisa que esté conectado y con permisos.", "mic_unavailable")
-        self.active, self.t0 = True, time.time()
 
     def stop(self):
         if self._stream is not None:
@@ -402,7 +412,7 @@ class Api:
         return {
             "identificado": r.identificado, "nombre": r.nombre, "similitud": r.similitud,
             "distancia": r.distancia if math.isfinite(r.distancia) else None,
-            "umbral_sim": config.UMBRAL_SIMILITUD, "umbral_dist": config.UMBRAL_DISTANCIA_EUCLIDIANA,
+            "umbral_sim": config.UMBRAL_SIMILITUD,
             "vivacidad_baja": viv is not None and viv < config.VIVACIDAD_UMBRAL, "desactualizados": desact,
         }
 

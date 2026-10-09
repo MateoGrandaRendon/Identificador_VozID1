@@ -93,12 +93,13 @@ MAX_MUESTRAS_POR_PERSONA = 25
 # ---------------------------------------------------------------------------
 # Parámetros de identificación
 # ---------------------------------------------------------------------------
-UMBRAL_SIMILITUD = 0.90    # umbral de similitud coseno (0-1) para aceptar una coincidencia
-                             # Calibrado con prueba sintética (4 "personas", 3 muestras c/u):
-                             # misma persona >= 0.9983, personas distintas <= 0.9946 (separación limpia).
-                             # Se deja en 0.90 (más conservador) porque voces reales, con ruido
-                             # ambiental y variación día a día, tendrán más solapamiento que una
-                             # señal sintética libre de ruido — ajusta con tus propias pruebas reales.
+UMBRAL_SIMILITUD = 0.995  # umbral de similitud coseno (0-1) para aceptar una coincidencia
+                           # Todos los embeddings tienen la misma norma (9 bloques L2 -> norma 3),
+                           # así que distancia² = 18·(1 - coseno): 0.995 equivale a distancia <= 0.30.
+                           # Calibrado con prueba sintética (4 "personas", 3 muestras c/u):
+                           # misma persona >= 0.9983, personas distintas <= 0.9949. Un umbral más
+                           # bajo (p. ej. 0.90) acepta a personas distintas: ajústalo solo con
+                           # pruebas de voces reales, nunca bajándolo "por si acaso".
 
 # ---------------------------------------------------------------------------
 # Versión del pipeline de extracción de embeddings
@@ -202,14 +203,9 @@ VAD_TOP_DB = 30.0
 # se rechaza la muestra (demasiado ruido de fondo/eco para confiar en ella).
 SNR_MINIMO_DB = 8.0
 
-# ---------------------------------------------------------------------------
-# Motor de comparación ESTRICTO: cosine + distancia euclidiana combinadas
-# ---------------------------------------------------------------------------
-# Una identificación solo se acepta si supera AMBOS criterios a la vez:
-# similitud coseno alta Y distancia euclidiana baja. Exigir las dos reduce
-# falsos positivos que una sola métrica, por separado, podría dejar pasar.
-UMBRAL_DISTANCIA_EUCLIDIANA = 0.30   # Calibrado con la misma prueba: misma persona <= 0.177,
-                                       # personas distintas >= 0.311. Se deja con margen conservador.
+# La identificación se decide solo con UMBRAL_SIMILITUD (ver arriba). La
+# distancia euclidiana se muestra como dato informativo: con embeddings de
+# norma fija aporta la misma información que la similitud coseno.
 
 # ---------------------------------------------------------------------------
 # Heurística de "vivacidad" (liveness) — ADVERTENCIA, no bloqueo automático

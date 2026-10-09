@@ -30,26 +30,27 @@ voice_identifier/
 ## 2. Preparar el entorno en VS Code
 
 Abre una terminal en VS Code (`Ctrl + ñ` / `Ctrl + \``) dentro de la carpeta
-`voice_identifier` y ejecuta:
+`voice_identifier` y ejecuta. Requiere **Python 3.12** (numpy 1.26.4 no
+tiene versión para 3.13):
 
 ### Windows (PowerShell)
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+py -3.12 -m venv .venv312
+.venv312\Scripts\Activate.ps1
 pip install -r requirements.txt
 python setup_seguridad.py
 ```
 
 ### macOS / Linux
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3.12 -m venv .venv312
+source .venv312/bin/activate
 pip install -r requirements.txt
 python setup_seguridad.py
 ```
 
 En VS Code, selecciona el intérprete del entorno virtual: `Ctrl+Shift+P` →
-**"Python: Select Interpreter"** → elige el que apunta a `.venv`.
+**"Python: Select Interpreter"** → elige el que apunta a `.venv312`.
 
 ### Dependencia del sistema operativo (importante)
 
@@ -144,5 +145,7 @@ Auditar dependencias: `pip-audit -r requirements.txt`.
 
 - **Embedding de voz**: MFCC + deltas, F0, formantes (LPC), energía,
   contraste espectral, ZCR y ritmo (`audio_processor.extraer_embedding`).
-- **Umbrales de decisión**: `UMBRAL_SIMILITUD` y
-  `UMBRAL_DISTANCIA_EUCLIDIANA` en `config.py`.
+- **Umbral de decisión**: `UMBRAL_SIMILITUD = 0.995` en `config.py` (similitud
+  coseno). Todos los embeddings tienen la misma norma, así que equivale a una
+  distancia euclidiana ≤ 0,30, que se muestra solo como dato informativo. Con
+  0,90 se aceptaba a personas distintas: si lo ajustas, calíbralo con voces reales.

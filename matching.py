@@ -6,7 +6,7 @@ capa de I/O (CLI en main.py).
 
 Por qué existe como módulo aparte:
  - Se puede probar con pytest sin necesitar micrófono, teclado ni una
-   base de datos real (ver tests/test_matching.py).
+   base de datos real (ver test/test_matching.py).
  - Cuando llegue la Fase 2 (API FastAPI/Flask) o una GUI, ambas
    reutilizan EXACTAMENTE esta misma lógica de decisión en vez de
    reimplementarla — una sola fuente de verdad para "¿esta voz es esta
@@ -59,11 +59,10 @@ def filtrar_perfiles_compatibles(perfiles_todos):
 def identificar_mejor_candidato(embedding_nuevo: np.ndarray, perfiles_compatibles) -> ResultadoIdentificacion:
     """
     Compara embedding_nuevo contra cada perfil ya filtrado como
-    compatible, con el motor ESTRICTO (similitud coseno Y distancia
-    euclidiana deben cumplir su umbral a la vez — ver config.py). Se
-    elige como candidato el de mayor similitud coseno; su distancia
-    euclidiana se evalúa después como segundo criterio obligatorio, no
-    como desempate.
+    compatible y elige como candidato el de mayor similitud coseno. Se
+    acepta si esa similitud alcanza config.UMBRAL_SIMILITUD. La distancia
+    euclidiana se calcula y se devuelve solo como dato informativo: no
+    decide la identificación.
 
     Nunca lanza excepción por dimensiones distintas: similitud_coseno y
     distancia_euclidiana (audio_processor.py) ya son defensivas ante eso.
@@ -78,9 +77,5 @@ def identificar_mejor_candidato(embedding_nuevo: np.ndarray, perfiles_compatible
         if similitud > mejor_similitud:
             mejor_similitud, mejor_distancia, mejor_nombre = similitud, distancia, nombre
 
-    identificado = (
-        mejor_nombre is not None
-        and mejor_similitud >= config.UMBRAL_SIMILITUD
-        and mejor_distancia <= config.UMBRAL_DISTANCIA_EUCLIDIANA
-    )
+    identificado = mejor_nombre is not None and mejor_similitud >= config.UMBRAL_SIMILITUD
     return ResultadoIdentificacion(mejor_nombre, mejor_similitud, mejor_distancia, identificado)

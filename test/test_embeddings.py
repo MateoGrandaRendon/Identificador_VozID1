@@ -1,6 +1,6 @@
 """
-tests/test_embeddings.py
--------------------------
+test/test_embeddings.py
+------------------------
 Pruebas de regresión para el bug crítico:
 
     ValueError: shapes (156,) and (60,) not aligned: 156 (dim 0) != 60 (dim 0)

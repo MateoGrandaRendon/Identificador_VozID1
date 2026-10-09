@@ -205,7 +205,7 @@ def identificar_persona() -> None:
 
     embedding_nuevo = ap.extraer_embedding(audio)
 
-    # --- Motor de comparación ESTRICTO: coseno Y euclidiana deben coincidir ---
+    # --- Decide la similitud coseno (config.UMBRAL_SIMILITUD); la distancia es solo informativa ---
     # (lógica de decisión centralizada en matching.py, reutilizable por la
     # futura API/GUI sin duplicar código ni riesgo de reintroducir el bug)
     resultado = matching.identificar_mejor_candidato(embedding_nuevo, perfiles)
@@ -398,7 +398,11 @@ def _eliminar_persona_flujo() -> None:
     if nombre is None:
         return
 
-    confirmacion = input(f"Escribe '{nombre}' de nuevo para confirmar el borrado: ").strip()
+    # Se normaliza igual que el nombre (espacios, NFC) para que "Ana  María" confirme a "Ana María".
+    try:
+        confirmacion = security.validar_nombre_persona(input(f"Escribe '{nombre}' de nuevo para confirmar el borrado: "))
+    except ValueError:
+        confirmacion = None
     if confirmacion != nombre:
         print(" Cancelado (el nombre no coincidió).")
         return

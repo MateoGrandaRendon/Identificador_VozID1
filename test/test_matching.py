@@ -1,6 +1,6 @@
 """
-tests/test_matching.py
------------------------
+test/test_matching.py
+----------------------
 Pruebas de la lógica de decisión en matching.py: filtrado de perfiles
 compatibles y elección del mejor candidato. Usa vectores numpy sintéticos
 directamente (sin pasar por librosa/extraer_embedding), así que corre
@@ -57,6 +57,39 @@ def test_identificar_mejor_candidato_reconoce_coincidencia_exacta():
     assert resultado.nombre == "Ana"
     assert resultado.similitud == pytest.approx(1.0)
     assert resultado.identificado is True
+
+
+def test_identificar_mejor_candidato_acepta_similitud_alta_aunque_distancia_sea_grande():
+    """Misma dirección, distinta magnitud: similitud 100% pero distancia
+    euclidiana grande. Solo decide la similitud, así que se identifica."""
+    embedding_nuevo = _vec(1.0)
+    perfiles = [("Emanuel", _vec(2.0))]
+
+    resultado = matching.identificar_mejor_candidato(embedding_nuevo, perfiles)
+
+    assert resultado.distancia > 0.30
+    assert resultado.nombre == "Emanuel"
+    assert resultado.identificado is True
+
+
+def _con_similitud(coseno: float) -> np.ndarray:
+    """Vector unitario cuya similitud coseno con e0 es exactamente `coseno`."""
+    v = np.zeros(config.EMBEDDING_DIM)
+    v[0], v[1] = coseno, np.sqrt(1 - coseno ** 2)
+    return v
+
+
+@pytest.mark.parametrize("coseno,esperado", [
+    (0.90, False),    # el umbral anterior: aceptaba a personas distintas
+    (0.9949, False),  # mejor caso entre personas distintas en la calibración sintética
+    (0.996, True),
+    (0.999, True),    # peor caso de la misma persona en la calibración sintética
+])
+def test_umbral_separa_misma_persona_de_personas_distintas(coseno, esperado):
+    e0 = np.zeros(config.EMBEDDING_DIM)
+    e0[0] = 1.0
+    resultado = matching.identificar_mejor_candidato(e0, [("Ana", _con_similitud(coseno))])
+    assert resultado.identificado is esperado
 
 
 def test_identificar_mejor_candidato_rechaza_bajo_umbral():
