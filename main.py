@@ -70,14 +70,14 @@ def _capturar_muestra_valida(paso: int, etiqueta: str, texto_lectura: str):
 
     while True:
         print(f"\n--- Muestra {paso} ({etiqueta}) ---")
-        print(f"📖 Lee en voz alta el siguiente texto (tendrás {duracion}s, sin prisa):\n   \"{texto_lectura}\"")
+        print(f" Lee en voz alta el siguiente texto (tendrás {duracion}s, sin prisa):\n   \"{texto_lectura}\"")
         input("\nPresiona ENTER cuando estés listo...")
         ap.cuenta_regresiva()
         audio, _, _, _ = ap.grabar_audio_con_analisis(duracion=duracion, guardar_audio=True)
 
         es_valida, motivo = ap.validar_calidad_muestra(audio)
         if not es_valida:
-            print(f"⚠️  Muestra rechazada: {motivo}")
+            print(f"  Muestra rechazada: {motivo}")
             reintentar = input("¿Repetir este paso ahora mismo? (s/n): ").strip().lower()
             if reintentar != "s":
                 return None
@@ -99,7 +99,7 @@ def _pedir_nombre(mensaje: str):
     try:
         return security.validar_nombre_persona(input(mensaje))
     except ValueError as e:
-        print(f"❌ {e}")
+        print(f" {e}")
         return None
 
 
@@ -130,13 +130,13 @@ def _grabar_muestras(minimo: int, maximo: int):
 
 
 def _guardar_perfil_cli(nombre: str, audios, modo: str) -> None:
-    print("\n⚙️  Procesando y guardando (extrayendo embeddings)...")
+    print("\n  Procesando y guardando (extrayendo embeddings)...")
     try:
         n = registro.guardar_perfil(nombre, audios, modo)
     except db.BaseDatosError as e:
-        print(f"❌ {e}")
+        print(f" {e}")
         return
-    print(f"✅ {n} muestra(s) guardada(s) para '{nombre}'.")
+    print(f" {n} muestra(s) guardada(s) para '{nombre}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ def registrar_persona() -> None:
     if nombre is None:
         return
     if db.obtener_speaker(nombre) is not None:
-        print(f"❌ '{nombre}' ya existe. Usa 'Gestionar personas' para re-entrenar o añadir muestras.")
+        print(f" '{nombre}' ya existe. Usa 'Gestionar personas' para re-entrenar o añadir muestras.")
         return
 
     minimo, maximo = registro.limites_nuevas_muestras("registro")
@@ -157,7 +157,7 @@ def registrar_persona() -> None:
     )
     audios = _grabar_muestras(minimo, maximo)
     if audios is None:
-        print(f"\n⏹️  Registro cancelado: no se guardó nada (se necesitan al menos {minimo} muestras).")
+        print(f"\n  Registro cancelado: no se guardó nada (se necesitan al menos {minimo} muestras).")
         return
     _guardar_perfil_cli(nombre, audios, "registro")
 
@@ -169,7 +169,7 @@ def identificar_persona() -> None:
     perfiles_todos = db.obtener_embeddings_todos()
 
     if not perfiles_todos:
-        print("⚠️  No hay personas registradas todavía. Usa la opción 1 primero.")
+        print("  No hay personas registradas todavía. Usa la opción 1 primero.")
         return
 
     # Solo se comparan embeddings generados con la versión Y dimensión
@@ -180,18 +180,18 @@ def identificar_persona() -> None:
 
     if desactualizados:
         print(
-            f"⚠️  Aviso: {len(desactualizados)} persona(s) tienen muestras de una versión "
+            f"  Aviso: {len(desactualizados)} persona(s) tienen muestras de una versión "
             f"anterior del motor y no se incluyen en esta comparación: {', '.join(desactualizados)}. "
             "Usa 'Gestionar personas → Re-entrenar' para actualizarlas."
         )
 
     if not perfiles:
-        print("⚠️  No hay perfiles compatibles con la versión actual del motor. Registra o re-entrena a alguien primero.")
+        print("  No hay perfiles compatibles con la versión actual del motor. Registra o re-entrena a alguien primero.")
         return
 
     texto = random.choice(config.TEXTOS_LECTURA_VERIFICACION)
     duracion = _duracion_para_texto(texto)
-    print(f"\n📖 Lee en voz alta el siguiente texto (distinto al usado en el registro; tendrás {duracion}s):")
+    print(f"\n Lee en voz alta el siguiente texto (distinto al usado en el registro; tendrás {duracion}s):")
     print(f"   \"{texto}\"")
     input("\nPresiona ENTER cuando estés listo...")
     ap.cuenta_regresiva()
@@ -199,7 +199,7 @@ def identificar_persona() -> None:
 
     es_valida, motivo = ap.validar_calidad_muestra(audio)
     if not es_valida:
-        print(f"⚠️  No se pudo analizar la grabación: {motivo}")
+        print(f"  No se pudo analizar la grabación: {motivo}")
         print("No se reconoce ninguna voz registrada")
         return
 
@@ -216,12 +216,12 @@ def identificar_persona() -> None:
     )
 
     if resultado.identificado:
-        print(f"🟢 IDENTIFICADO como: {resultado.nombre} (confianza {resultado.similitud:.1%})")
+        print(f" IDENTIFICADO como: {resultado.nombre} (confianza {resultado.similitud:.1%})")
 
         vivacidad = ap.calcular_puntaje_vivacidad(audio)
         if vivacidad < config.VIVACIDAD_UMBRAL:
             print(
-                f"⚠️  Aviso informativo: puntaje de vivacidad bajo ({vivacidad:.2f}). "
+                f"  Aviso informativo: puntaje de vivacidad bajo ({vivacidad:.2f}). "
                 "Esta es solo una heurística ligera, no una prueba de que el audio sea "
                 "una grabación reproducida — no se bloquea el acceso, pero si tienes dudas, verifica en persona."
             )
@@ -235,7 +235,7 @@ def identificar_persona() -> None:
 def listar_personas() -> None:
     personas = db.listar_speakers()
     if not personas:
-        print("⚠️  No hay personas registradas.")
+        print("  No hay personas registradas.")
         return
 
     # Diagnóstico por persona: cuántas de sus muestras son compatibles con
@@ -246,10 +246,10 @@ def listar_personas() -> None:
     for p in personas:
         estado = ""
         if p["necesita_reentrenar"]:
-            estado = "  ⚠️  DESACTUALIZADA (re-entrenar antes de poder identificarse)"
+            estado = "    DESACTUALIZADA (re-entrenar antes de poder identificarse)"
         elif p["muestras_compatibles"] < p["total_muestras"]:
             estado = (
-                f"  ⚠️  {p['total_muestras'] - p['muestras_compatibles']} "
+                f"    {p['total_muestras'] - p['muestras_compatibles']} "
                 "muestra(s) obsoleta(s) mezclada(s) con muestras vigentes"
             )
         print(
@@ -279,7 +279,7 @@ def _pedir_duracion_tono() -> int:
         try:
             duracion = int(entrada)
         except ValueError:
-            print("⚠️  Ingresa solo un número entero (sin letras ni decimales).")
+            print("  Ingresa solo un número entero (sin letras ni decimales).")
             continue
 
         if duracion > config.TONO_DURACION_MAX:
@@ -310,7 +310,7 @@ def analizar_modulacion_voz() -> None:
         print(f"Clasificación de tu voz: {clasificacion}")
         print(f"Volumen promedio (RMS): {volumen_promedio:.4f}")
     else:
-        print("⚠️  No se detectó suficiente señal de voz para analizar el tono.")
+        print("  No se detectó suficiente señal de voz para analizar el tono.")
         print("   Revisa el micrófono o intenta hablar más fuerte y cerca.")
     print("-" * 50)
 
@@ -328,11 +328,11 @@ def _renombrar_persona_flujo() -> None:
 
     resultado = db.renombrar_speaker(nombre_actual, nombre_nuevo)
     if resultado == "ok":
-        print(f"✅ '{nombre_actual}' ahora se llama '{nombre_nuevo}'.")
+        print(f" '{nombre_actual}' ahora se llama '{nombre_nuevo}'.")
     elif resultado == "no_existe":
-        print(f"⚠️  No se encontró a '{nombre_actual}'.")
+        print(f"  No se encontró a '{nombre_actual}'.")
     elif resultado == "duplicado":
-        print(f"❌ Ya existe una persona registrada como '{nombre_nuevo}'.")
+        print(f" Ya existe una persona registrada como '{nombre_nuevo}'.")
 
 
 def _reentrenar_persona_flujo() -> None:
@@ -346,7 +346,7 @@ def _reentrenar_persona_flujo() -> None:
         return
     speaker = db.obtener_speaker(nombre)
     if speaker is None:
-        print(f"⚠️  No se encontró a '{nombre}'.")
+        print(f"  No se encontró a '{nombre}'.")
         return
 
     minimo, maximo = registro.limites_nuevas_muestras("reentrenar")
@@ -360,7 +360,7 @@ def _reentrenar_persona_flujo() -> None:
 
     audios = _grabar_muestras(minimo, maximo)
     if audios is None:
-        print("\n⏹️  Re-entrenamiento cancelado: se conservan las muestras anteriores.")
+        print("\n  Re-entrenamiento cancelado: se conservan las muestras anteriores.")
         return
     _guardar_perfil_cli(speaker["nombre"], audios, "reentrenar")
 
@@ -372,12 +372,12 @@ def _ampliar_persona_flujo() -> None:
         return
     speaker = db.obtener_speaker(nombre)
     if speaker is None:
-        print(f"⚠️  No se encontró a '{nombre}'.")
+        print(f"  No se encontró a '{nombre}'.")
         return
 
     minimo, maximo = registro.limites_nuevas_muestras("ampliar", len(speaker["muestras"]))
     if maximo == 0:
-        print(f"⚠️  '{speaker['nombre']}' ya tiene el máximo de {config.MAX_MUESTRAS_POR_PERSONA} muestras.")
+        print(f"  '{speaker['nombre']}' ya tiene el máximo de {config.MAX_MUESTRAS_POR_PERSONA} muestras.")
         return
     print(f"'{speaker['nombre']}' tiene {len(speaker['muestras'])} muestra(s); puedes añadir hasta {maximo}.")
 
@@ -400,15 +400,15 @@ def _eliminar_persona_flujo() -> None:
 
     confirmacion = input(f"Escribe '{nombre}' de nuevo para confirmar el borrado: ").strip()
     if confirmacion != nombre:
-        print("❌ Cancelado (el nombre no coincidió).")
+        print(" Cancelado (el nombre no coincidió).")
         return
 
     existia, archivos_borrados = db.eliminar_speaker_completo(nombre)
 
     if existia:
-        print(f"✅ '{nombre}' eliminado de la base de datos ({archivos_borrados} archivo(s) borrado(s) de disco).")
+        print(f" '{nombre}' eliminado de la base de datos ({archivos_borrados} archivo(s) borrado(s) de disco).")
     else:
-        print(f"⚠️  No se encontró a '{nombre}' en el sistema.")
+        print(f"  No se encontró a '{nombre}' en el sistema.")
 
 
 def _reproducir_audios_flujo() -> None:
@@ -420,7 +420,7 @@ def _reproducir_audios_flujo() -> None:
     """
     personas = db.listar_speakers()
     if not personas:
-        print("⚠️  No hay personas registradas.")
+        print("  No hay personas registradas.")
         return
 
     print("\nPersonas registradas:")
@@ -434,7 +434,7 @@ def _reproducir_audios_flujo() -> None:
 
     speaker = db.obtener_speaker(personas[int(seleccion) - 1]["nombre"])
     if speaker is None or not speaker["muestras"]:
-        print("⚠️  Esa persona no tiene muestras guardadas.")
+        print("  Esa persona no tiene muestras guardadas.")
         return
 
     total = len(speaker["muestras"])
@@ -452,10 +452,10 @@ def _reproducir_audios_flujo() -> None:
             audio = ap.cargar_audio_desde_archivo(db.ruta_audio_segura(muestra["archivo_audio"]))
             ap.reproducir_audio(audio)
         except FileNotFoundError:
-            print("⚠️  El archivo de audio ya no existe en disco.")
+            print("  El archivo de audio ya no existe en disco.")
         except Exception:
             log.exception("Fallo al reproducir una muestra")
-            print("⚠️  No se pudo reproducir la muestra.")
+            print("  No se pudo reproducir la muestra.")
 
 
 def gestionar_personas() -> None:
@@ -485,7 +485,7 @@ def gestionar_personas() -> None:
         elif opcion == "6":
             return
         else:
-            print("❌ Opción no válida, intenta de nuevo.")
+            print(" Opción no válida, intenta de nuevo.")
 
 
 NOMBRE_PRUEBA = "_usuario_prueba_"
@@ -518,7 +518,7 @@ def ejecutar_pruebas_automaticas() -> None:
     no permite que una persona real se llame así.
     """
     print("\n" + "=" * 60)
-    print("🔍 EJECUTANDO PRUEBAS DE VERIFICACIÓN AUTOMÁTICAS")
+    print(" EJECUTANDO PRUEBAS DE VERIFICACIÓN AUTOMÁTICAS")
     print("=" * 60)
 
     errores = []
@@ -530,12 +530,12 @@ def ejecutar_pruebas_automaticas() -> None:
         audio_test = ap.grabar_audio(duracion=2)
         volumen = float(np.abs(audio_test).mean())
         if volumen < 1e-6:
-            print("   ⚠️  Se grabó audio, pero parece silencio total (revisa el micrófono).")
+            print("     Se grabó audio, pero parece silencio total (revisa el micrófono).")
         else:
-            print(f"   ✅ Micrófono OK. Nivel de señal promedio: {volumen:.6f}")
+            print(f"    Micrófono OK. Nivel de señal promedio: {volumen:.6f}")
     except Exception as e:
         errores.append(f"Micrófono: {e}")
-        print(f"   ❌ Error al grabar: {e}")
+        print(f"   Error al grabar: {e}")
         print("   ↳ Se usará una señal sintética para poder continuar con las demás pruebas.")
         audio_test = (np.random.randn(config.SAMPLE_RATE * 2) * 0.01).astype(np.float32)
 
@@ -543,13 +543,13 @@ def ejecutar_pruebas_automaticas() -> None:
     print("\n[2/3] Probando conexión, escritura y lectura en la base de datos...")
     try:
         if probar_base_datos(audio_test):
-            print("   ✅ Base de datos OK. Registro de prueba escrito, releído y eliminado en MongoDB.")
+            print("    Base de datos OK. Registro de prueba escrito, releído y eliminado en MongoDB.")
         else:
             raise RuntimeError("El registro de prueba no se encontró después de guardarlo.")
     except Exception:
         log.exception("Prueba de base de datos fallida")
         errores.append("Base de datos: no se pudo escribir/leer (detalles en data/logs/voiceid.log)")
-        print("   ❌ Error de base de datos (detalles en data/logs/voiceid.log)")
+        print("    Error de base de datos (detalles en data/logs/voiceid.log)")
 
     # --- Test 3: Extracción de embedding y comparación (modelo) ---
     print("\n[3/3] Probando extracción de embedding y comparación...")
@@ -558,19 +558,19 @@ def ejecutar_pruebas_automaticas() -> None:
         emb2 = ap.extraer_embedding(audio_test)  # misma señal -> similitud esperada ≈ 1.0
         score = ap.similitud_coseno(emb1, emb2)
         if score > 0.99:
-            print(f"   ✅ Modelo OK. Similitud de la muestra consigo misma: {score:.4f} (esperado ≈ 1.0000)")
+            print(f"    Modelo OK. Similitud de la muestra consigo misma: {score:.4f} (esperado ≈ 1.0000)")
         else:
             raise RuntimeError(f"Similitud inesperadamente baja: {score:.4f}")
     except Exception as e:
         errores.append(f"Modelo/embedding: {e}")
-        print(f"   ❌ Error al procesar el embedding: {e}")
+        print(f"    Error al procesar el embedding: {e}")
 
     # --- Resumen final ---
     print("\n" + "=" * 60)
     if not errores:
-        print("🎉 TODAS LAS PRUEBAS PASARON CORRECTAMENTE. El sistema está listo para usarse.")
+        print(" TODAS LAS PRUEBAS PASARON CORRECTAMENTE. El sistema está listo para usarse.")
     else:
-        print(f"⚠️  Se encontraron {len(errores)} problema(s):")
+        print(f"  Se encontraron {len(errores)} problema(s):")
         for err in errores:
             print(f"   - {err}")
     print("=" * 60)
@@ -606,10 +606,10 @@ def menu() -> None:
         elif opcion == "6":
             ejecutar_pruebas_automaticas()
         elif opcion == "7":
-            print("Hasta luego 👋")
+            print("Hasta luego ")
             sys.exit(0)
         else:
-            print("❌ Opción no válida, intenta de nuevo.")
+            print(" Opción no válida, intenta de nuevo.")
 
 
 def _arrancar() -> None:
@@ -617,7 +617,7 @@ def _arrancar() -> None:
     try:
         db.init_db()
     except db.BaseDatosError as e:
-        print(f"❌ {e}")
+        print(f" {e}")
         sys.exit(1)
     if not security.pedir_acceso():
         sys.exit(1)
@@ -626,14 +626,14 @@ def _arrancar() -> None:
     try:
         menu()
     except KeyboardInterrupt:
-        print("\nHasta luego 👋")
+        print("\nHasta luego ")
     except db.BaseDatosError as e:
-        print(f"❌ {e}")
+        print(f" {e}")
         sys.exit(1)
     except Exception:
         # Nunca se muestra la traza interna al usuario: queda en el log.
         log.exception("Error inesperado en el CLI")
-        print("❌ Error inesperado. Los detalles técnicos se guardaron en data/logs/voiceid.log")
+        print(" Error inesperado. Los detalles técnicos se guardaron en data/logs/voiceid.log")
         sys.exit(1)
 
 
