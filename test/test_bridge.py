@@ -5,10 +5,12 @@ Pruebas de la API que pywebview expone a JavaScript (frontend/bridge.py):
 autenticación, sesión, rate limiting, validación de entradas, límite de
 muestras del asistente y que nunca se filtren mensajes internos.
 """
+import threading
 import time
 
 import numpy as np
 import pytest
+from webview.util import js_bridge_call
 
 import config
 import database as db
@@ -43,6 +45,52 @@ def test_superficie_publica_es_exactamente_la_esperada():
     assert publicos == PUBLICOS
 
 
+class _VentanaFalsa:
+    """Lo mínimo que usa webview.util.js_bridge_call: funciones expuestas, js_api y evaluate_js."""
+
+    def __init__(self, api):
+        self._functions = {f.__name__: f for f in bridge.funciones_js(api)}
+        self._js_api = bridge.FachadaJS()
+        self.respuestas = []
+        self.listo = threading.Event()
+
+    def evaluate_js(self, codigo):
+        self.respuestas.append(codigo)
+        self.listo.set()
+
+
+def _llamar_desde_js(ventana, nombre, params):
+    """Llama al despachador REAL de pywebview, como lo haría un script de la ventana."""
+    ventana.listo.clear()
+    js_bridge_call(ventana, nombre, params, "1")
+    return ventana.listo.wait(5)
+
+
+def test_solo_se_exponen_los_metodos_publicos(api):
+    assert {f.__name__ for f in bridge.funciones_js(api)} == PUBLICOS
+    assert dir(bridge.FachadaJS()) == []
+
+
+@pytest.mark.parametrize("nombre,params", [
+    ("__setattr__", ["_auth", True]),          # saltarse el PIN escribiendo el estado de sesión
+    ("_cerrar_sesion", []),
+    ("_rec.start", []),                        # abrir el micrófono sin sesión
+    ("__class__", []),
+    ("login.__globals__.__setitem__", ["_ABIERTOS", ["list_speakers"]]),
+])
+def test_despachador_de_pywebview_no_alcanza_miembros_privados(api, nombre, params):
+    ventana = _VentanaFalsa(api)
+    assert not _llamar_desde_js(ventana, nombre, params)   # pywebview no encuentra la función
+    assert api._auth is False and api._rec.active is False
+    assert "list_speakers" not in bridge._ABIERTOS
+
+
+def test_despachador_de_pywebview_llama_a_los_metodos_publicos_con_sesion(api):
+    ventana = _VentanaFalsa(api)
+    assert _llamar_desde_js(ventana, "list_speakers", [])
+    assert '"code": "auth"' in ventana.respuestas[-1]
+
+
 def test_metodos_protegidos_exigen_sesion(api):
     for metodo in ("list_speakers", "delete_speaker", "record_start", "run_test"):
         r = getattr(api, metodo)(*(["Ana"] if metodo == "delete_speaker" else [1] if metodo == "run_test" else []))
@@ -60,6 +108,12 @@ def test_sesion_caduca_por_inactividad_y_descarta_datos(sesion):
     sesion._ultima_actividad -= config.SESION_INACTIVIDAD_SEG + 1
     assert sesion.list_speakers()["code"] == "auth"
     assert sesion._pending is None and sesion._auth is False
+
+
+def test_grabacion_olvidada_no_evita_el_bloqueo_por_inactividad(sesion):
+    sesion._rec.active, sesion._rec.t0 = True, time.time() - config.GRABACION_MAX_SEG - 1
+    sesion._ultima_actividad -= config.SESION_INACTIVIDAD_SEG + 1
+    assert sesion.list_speakers()["code"] == "auth"
 
 
 def test_sesion_caduca_por_tiempo_maximo(sesion):

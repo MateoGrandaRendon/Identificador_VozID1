@@ -22,13 +22,28 @@ load_dotenv()
 # `python setup_seguridad.py`, que los guarda en .env (archivo que está en
 # .gitignore y nunca se sube al repositorio). Si no existen, security.py
 # lo detecta y pide correr el script de configuración.
+def _entero_env(nombre: str, defecto: int) -> int:
+    """
+    Entero leído del entorno. Vacío (p. ej. un .env copiado de .env.example) usa
+    el valor por defecto; un valor que no es un número detiene el programa con un
+    mensaje claro en vez de una traza de ValueError.
+    """
+    valor = (os.getenv(nombre) or "").strip()
+    if not valor:
+        return defecto
+    try:
+        return int(valor)
+    except ValueError:
+        raise SystemExit(f"{nombre} en .env debe ser un número entero.") from None
+
+
 PIN_SALT = os.getenv("VOICE_ID_PIN_SALT")
 PIN_HASH = os.getenv("VOICE_ID_PIN_HASH")
 FERNET_KEY = os.getenv("VOICE_ID_FERNET_KEY")
 # Iteraciones PBKDF2 con las que se generó el hash del PIN. Los .env creados
 # antes de este cambio no traen la variable y usaban 200 000; los nuevos
 # (setup_seguridad.py) usan 600 000, el mínimo recomendado por OWASP (2023).
-PIN_ITERACIONES = int(os.getenv("VOICE_ID_PIN_ITER", "200000"))
+PIN_ITERACIONES = _entero_env("VOICE_ID_PIN_ITER", 200000)
 
 # ---------------------------------------------------------------------------
 # Base de datos: MongoDB (no relacional)
@@ -40,7 +55,7 @@ PIN_ITERACIONES = int(os.getenv("VOICE_ID_PIN_ITER", "200000"))
 # a un host remoto sin TLS se rechaza (ver database._validar_uri).
 MONGODB_URI = os.getenv("VOICE_ID_MONGODB_URI", "mongodb://127.0.0.1:27017")
 MONGODB_DB = os.getenv("VOICE_ID_MONGODB_DB", "voice_id")
-MONGODB_TIMEOUT_MS = int(os.getenv("VOICE_ID_MONGODB_TIMEOUT_MS", "5000"))
+MONGODB_TIMEOUT_MS = _entero_env("VOICE_ID_MONGODB_TIMEOUT_MS", 5000)
 
 # ---------------------------------------------------------------------------
 # Optimización para entornos de nube / contenedores livianos
@@ -65,6 +80,7 @@ DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audio"          # Muestras de audio (.wav) y embeddings (.npy)
 LOG_DIR = DATA_DIR / "logs"            # Registro técnico de errores (sin datos biométricos)
 SQLITE_LEGADO_PATH = DATA_DIR / "voice_id.db"  # BD SQLite de versiones anteriores (solo para migrar)
+MODELO_DIR = Path(os.getenv("VOICE_ID_MODELO_DIR") or DATA_DIR / "modelos" / "ecapa")  # modelo ECAPA (python -m motor_ecapa)
 
 # Crear carpetas necesarias si no existen (se ejecuta al importar el módulo).
 # mode=0o700: solo el usuario dueño puede leerlas (en Windows se heredan los
@@ -93,26 +109,43 @@ MAX_MUESTRAS_POR_PERSONA = 25
 # ---------------------------------------------------------------------------
 # Parámetros de identificación
 # ---------------------------------------------------------------------------
-UMBRAL_SIMILITUD = 0.995  # umbral de similitud coseno (0-1) para aceptar una coincidencia
-                           # Todos los embeddings tienen la misma norma (9 bloques L2 -> norma 3),
-                           # así que distancia² = 18·(1 - coseno): 0.995 equivale a distancia <= 0.30.
-                           # Calibrado con prueba sintética (4 "personas", 3 muestras c/u):
-                           # misma persona >= 0.9983, personas distintas <= 0.9949. Un umbral más
-                           # bajo (p. ej. 0.90) acepta a personas distintas: ajústalo solo con
-                           # pruebas de voces reales, nunca bajándolo "por si acaso".
+# Umbral de similitud coseno para aceptar una coincidencia; depende del motor
+# (ver MOTOR_EMBEDDING más abajo). Calibrado con voces REALES (2026-10-10):
+#   ECAPA:   misma persona 0,70-0,77 (misma sesión) y 0,63-0,66 (otro día);
+#            otras personas 0,00-0,09  -> umbral 0,40, con margen a ambos lados.
+#   clásico: misma persona 0,978-0,991 y otras personas 0,961-0,985: se solapan,
+#            ningún umbral funciona (0,995 solo venía de voces sintéticas).
+# Para recalibrar con TUS personas registradas: python calibrar_umbral.py
+_UMBRALES = {"ecapa": 0.40, "clasico": 0.995}
+
+# Cada persona se puntúa con el PROMEDIO de sus N muestras más parecidas a la
+# voz nueva (no con la mejor muestra suelta, que acepta coincidencias casuales).
+MUESTRAS_COMPARADAS = 4
+
+# Margen frente a la segunda persona más parecida: su distancia euclidiana
+# media debe ser al menos MARGEN_DISTANCIA veces la de la primera. Con voces
+# sintéticas parecidas, 1.1 bajó las identificaciones falsas del 50 % al 4 %.
+# 1.0 = sin margen. Calíbralo con: python calibrar_umbral.py
+MARGEN_DISTANCIA = 1.1
 
 # ---------------------------------------------------------------------------
-# Versión del pipeline de extracción de embeddings
+# Motor de embeddings y versión del pipeline
 # ---------------------------------------------------------------------------
-# Sube este número cada vez que cambies QUÉ características entran al
-# embedding (agregar/quitar bloques, cambiar N_MFCC, etc.). Cada embedding
-# se "sella" con esta versión al guardarse (ver database.guardar_muestra).
-# Si luego mejoras el pipeline y la dimensión cambia, los perfiles viejos
-# se detectan automáticamente como desactualizados — en vez de romper el
-# programa comparando vectores de tamaños distintos — y el sistema avisa
-# qué personas necesitan re-entrenarse (Gestionar personas → Re-entrenar).
-EMBEDDING_VERSION = 2
-EMBEDDING_DIM = 156   # dimensión esperada del embedding con la versión actual
+# "ecapa":   modelo preentrenado ECAPA-TDNN (motor_ecapa.py), 192 dimensiones.
+#            Separa personas de verdad: con voces reales, el embedding clásico
+#            daba 0,96-0,99 entre CUALQUIER par de voces (misma persona o no).
+# "clasico": características hechas a mano (MFCC, F0, formantes...), 156 dim.
+#            Solo para equipos sin PyTorch: no distingue bien a las personas.
+# Cada embedding se "sella" con EMBEDDING_VERSION al guardarse. Si cambia el
+# motor o el pipeline, los perfiles viejos se detectan como desactualizados
+# (en vez de comparar vectores incompatibles); como el audio cifrado está en
+# data/audio, se recalculan sin volver a grabar: python recalcular_embeddings.py
+MOTOR_EMBEDDING = (os.getenv("VOICE_ID_MOTOR") or "ecapa").strip().lower()
+if MOTOR_EMBEDDING not in ("ecapa", "clasico"):
+    raise SystemExit("VOICE_ID_MOTOR en .env debe ser 'ecapa' o 'clasico'.")
+EMBEDDING_VERSION = 3 if MOTOR_EMBEDDING == "ecapa" else 2
+EMBEDDING_DIM = 192 if MOTOR_EMBEDDING == "ecapa" else 156
+UMBRAL_SIMILITUD = _UMBRALES[MOTOR_EMBEDDING]
 
 # ---------------------------------------------------------------------------
 # Parámetros de extracción de características (MFCC)
@@ -164,6 +197,7 @@ FORMANTE_ANCHO_BANDA_MAX_HZ = 400.0  # descarta polos LPC "anchos" (ruido, no fo
 # Validación de calidad de una muestra recién grabada (evita falsos
 # positivos por audio silencioso o saturado antes de guardarla/compararla)
 # ---------------------------------------------------------------------------
+MUESTRA_DURACION_MIN_SEG = 1.0        # por debajo, el embedding no tiene frames suficientes
 REGISTRO_VOLUMEN_MINIMO = 0.01        # RMS mínimo para considerar que hay voz real
 REGISTRO_SATURACION_MAXIMA = 0.05     # máx. proporción de muestras "clippeadas" (ruido excesivo)
 

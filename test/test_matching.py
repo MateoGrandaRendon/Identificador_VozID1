@@ -79,17 +79,82 @@ def _con_similitud(coseno: float) -> np.ndarray:
     return v
 
 
-@pytest.mark.parametrize("coseno,esperado", [
-    (0.90, False),    # el umbral anterior: aceptaba a personas distintas
-    (0.9949, False),  # mejor caso entre personas distintas en la calibración sintética
-    (0.996, True),
-    (0.999, True),    # peor caso de la misma persona en la calibración sintética
+@pytest.mark.parametrize("motor,coseno,esperado", [
+    # ECAPA, valores medidos con voces reales (2026-10-10)
+    ("ecapa", 0.094, False),   # otra persona: el caso más parecido medido
+    ("ecapa", 0.39, False),    # justo bajo el umbral
+    ("ecapa", 0.63, True),     # la misma persona, grabada otro día (peor caso medido)
+    ("ecapa", 0.77, True),     # la misma persona, misma sesión
+    # Clásico (solo calibrado con voces sintéticas)
+    ("clasico", 0.90, False),
+    ("clasico", 0.9949, False),
+    ("clasico", 0.996, True),
 ])
-def test_umbral_separa_misma_persona_de_personas_distintas(coseno, esperado):
+def test_umbral_separa_misma_persona_de_personas_distintas(monkeypatch, motor, coseno, esperado):
+    monkeypatch.setattr(config, "UMBRAL_SIMILITUD", config._UMBRALES[motor])
     e0 = np.zeros(config.EMBEDDING_DIM)
     e0[0] = 1.0
     resultado = matching.identificar_mejor_candidato(e0, [("Ana", _con_similitud(coseno))])
     assert resultado.identificado is esperado
+
+
+def _e0():
+    e0 = np.zeros(config.EMBEDDING_DIM)
+    e0[0] = 1.0
+    return e0
+
+
+def _perfil(nombre, cosenos):
+    return [(nombre, _con_similitud(c)) for c in cosenos]
+
+
+def test_promedio_de_4_no_se_deja_enganar_por_una_muestra_casual():
+    """Ana tiene UNA muestra casi idéntica por casualidad y el resto lejos;
+    Luis es consistentemente parecido. Con el máximo ganaba Ana; con el
+    promedio de las 4 más parecidas gana Luis."""
+    perfiles = _perfil("Ana", [0.9999, 0.95, 0.95, 0.95, 0.95]) + _perfil("Luis", [0.998] * 4)
+    resultado = matching.identificar_mejor_candidato(_e0(), perfiles)
+    assert resultado.nombre == "Luis"
+    assert resultado.similitud == pytest.approx(0.998)
+
+
+def test_promedio_usa_solo_las_4_mejores_muestras():
+    perfiles = _perfil("Ana", [0.999, 0.999, 0.999, 0.999, 0.50, 0.40])
+    puntuacion = matching.puntuar_personas(_e0(), perfiles)[0]
+    assert puntuacion.similitud == pytest.approx(0.999)
+
+
+def test_persona_con_menos_de_4_muestras_compatibles_promedia_las_que_tiene():
+    puntuacion = matching.puntuar_personas(_e0(), _perfil("Ana", [0.998, 0.996]))[0]
+    assert puntuacion.similitud == pytest.approx(0.997)
+
+
+def test_margen_insuficiente_frente_al_segundo_no_identifica():
+    """Dos personas casi igual de parecidas: es ambiguo, no se asigna a nadie."""
+    perfiles = _perfil("Ana", [0.9980] * 4) + _perfil("Luis", [0.9979] * 4)
+    resultado = matching.identificar_mejor_candidato(_e0(), perfiles)
+    assert resultado.nombre == "Ana" and resultado.segundo == "Luis"
+    assert resultado.margen < config.MARGEN_DISTANCIA
+    assert resultado.identificado is False
+
+
+def test_margen_claro_frente_al_segundo_identifica():
+    perfiles = _perfil("Ana", [0.999] * 4) + _perfil("Luis", [0.990] * 4)
+    resultado = matching.identificar_mejor_candidato(_e0(), perfiles)
+    # distancia ∝ sqrt(1 - coseno): sqrt(0.010 / 0.001) ≈ 3.16 veces más lejos
+    assert resultado.margen == pytest.approx(np.sqrt(10), rel=1e-3)
+    assert resultado.identificado is True
+
+
+def test_coincidencia_exacta_tiene_margen_infinito():
+    perfiles = _perfil("Ana", [1.0] * 4) + _perfil("Luis", [0.99] * 4)
+    resultado = matching.identificar_mejor_candidato(_e0(), perfiles)
+    assert resultado.margen == float("inf") and resultado.identificado is True
+
+
+def test_una_sola_persona_no_tiene_margen():
+    resultado = matching.identificar_mejor_candidato(_e0(), _perfil("Ana", [0.999] * 4))
+    assert resultado.segundo is None and resultado.margen is None and resultado.identificado is True
 
 
 def test_identificar_mejor_candidato_rechaza_bajo_umbral():

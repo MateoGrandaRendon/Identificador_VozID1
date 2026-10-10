@@ -23,6 +23,7 @@ import soundfile as sf
 import librosa
 
 import config
+import motor_ecapa
 import security
 
 
@@ -150,6 +151,16 @@ def validar_calidad_muestra(audio: np.ndarray, samplerate: int = None) -> tuple:
 
     if audio is None or len(audio) == 0:
         return False, "No se capturó audio (posible corte del micrófono)."
+
+    # Antes de medir nada: con NaN/inf todas las comparaciones de abajo dan False
+    # y la muestra se aceptaba, para romper después en extraer_embedding.
+    audio = np.asarray(audio)
+    if audio.ndim != 1 or not np.issubdtype(audio.dtype, np.floating):
+        return False, "Formato de audio no válido (se esperaba una señal mono)."
+    if not np.isfinite(audio).all():
+        return False, "El audio contiene valores no válidos (posible fallo del micrófono): repite la grabación."
+    if len(audio) < config.MUESTRA_DURACION_MIN_SEG * samplerate:
+        return False, f"La grabación es demasiado corta (mínimo {config.MUESTRA_DURACION_MIN_SEG:g} s)."
 
     volumen = float(np.abs(audio).mean())
     if volumen < config.REGISTRO_VOLUMEN_MINIMO:
@@ -310,7 +321,30 @@ def _analizar_formantes_y_ritmo(audio: np.ndarray, samplerate: int):
 
 def extraer_embedding(audio: np.ndarray, samplerate: int = None) -> np.ndarray:
     """
-    Motor biométrico avanzado: construye un embedding multi-factorial
+    Embedding de la voz con el motor configurado (config.MOTOR_EMBEDDING):
+    "ecapa" (por defecto, modelo preentrenado de motor_ecapa.py, 192 dim) o
+    "clasico" (características hechas a mano, ver extraer_embedding_clasico).
+    """
+    if audio is None or len(audio) == 0:
+        raise ValueError("El audio recibido está vacío; no se puede extraer un embedding.")
+    if config.MOTOR_EMBEDDING == "ecapa":
+        return motor_ecapa.extraer_embedding(audio, samplerate)
+    return extraer_embedding_clasico(audio, samplerate)
+
+
+def verificar_motor() -> None:
+    """Al arrancar: comprueba que el motor de embeddings está listo (lanza RuntimeError con un mensaje claro)."""
+    if config.MOTOR_EMBEDDING == "ecapa":
+        motor_ecapa.verificar()
+
+
+def extraer_embedding_clasico(audio: np.ndarray, samplerate: int = None) -> np.ndarray:
+    """
+    Motor clásico (config.MOTOR_EMBEDDING = "clasico"). Con voces reales da
+    similitudes de 0,96-0,99 entre CUALQUIER par de voces: no separa bien a
+    las personas; se conserva solo para equipos sin PyTorch.
+
+    Construye un embedding multi-factorial
     combinando FACTORES FISIOLÓGICOS (anatomía del tracto vocal) y
     FACTORES COMPORTAMENTALES (forma de hablar), cada bloque normalizado
     (L2) por separado antes de unirse:

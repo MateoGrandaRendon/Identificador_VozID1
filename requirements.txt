@@ -1,3 +1,5 @@
+# PyTorch en su versión CPU (más liviana; el motor ECAPA no necesita GPU)
+--extra-index-url https://download.pytorch.org/whl/cpu
 sounddevice==0.4.7
 soundfile==0.12.1
 numpy==1.26.4
@@ -6,3 +8,6 @@ pymongo==4.18.3
 python-dotenv==1.2.4
 cryptography==50.0.2
 pywebview==6.2.1
+torch==2.14.1
+torchaudio==2.11.0
+speechbrain==1.1.1

@@ -12,9 +12,13 @@ Mapa UI → backend existente (no se duplica lógica, solo se orquesta):
   Pruebas                 : ap.grabar_audio, cli.probar_base_datos, ap.extraer_embedding, ap.similitud_coseno
   PIN                     : security.ControlAcceso (mismo PIN/.env y mismo bloqueo que el CLI)
 
-Superficie de ataque: pywebview expone a JavaScript TODOS los métodos
-públicos de Api. Por eso:
-  - Todo lo que no debe llamarse desde JS empieza por "_".
+Superficie de ataque: Api NO se entrega a pywebview como js_api. El despachador
+de pywebview (webview/util.py, js_bridge_call) resuelve el nombre pedido desde JS
+con getattr encadenado y sin filtrar "_" ni dunder: con Api como js_api, un script
+en la ventana podría llamar a "__setattr__" y poner _auth=True sin el PIN. Por eso:
+  - js_api es FachadaJS, un objeto sin ningún atributo alcanzable.
+  - Solo los métodos públicos de Api se registran con window.expose (funciones_js):
+    pywebview los busca por nombre EXACTO, sin recorrer atributos.
   - Todo método público pasa por @_safe: exige sesión (salvo _ABIERTOS),
     limita la frecuencia de llamadas, valida tipos y nunca devuelve trazas
     ni mensajes internos (van al log).
@@ -35,6 +39,7 @@ import time
 
 import numpy as np
 import sounddevice as sd
+from pymongo.errors import PyMongoError
 
 import audio_processor as ap
 import config
@@ -62,6 +67,7 @@ _LIMITES = {
 }
 _LIMITE_DEFECTO = (60, 10)
 _MENSAJE_INTERNO = "Error interno. Los detalles técnicos se guardaron en data/logs/voiceid.log."
+_MENSAJE_BD_CAIDA = "No se pudo conectar con MongoDB: comprueba que el servicio esté en marcha y vuelve a intentarlo."
 
 
 class ApiError(Exception):
@@ -116,6 +122,9 @@ def _safe(fn):
             return {"ok": False, "data": None, "error": str(e), "code": e.code}
         except db.BaseDatosError as e:   # mensajes ya redactados para el usuario
             return {"ok": False, "data": None, "error": str(e), "code": "db"}
+        except PyMongoError as e:        # MongoDB caído o inaccesible a mitad de sesión
+            log.warning("MongoDB no disponible en %s: %s", nombre, type(e).__name__)
+            return {"ok": False, "data": None, "error": _MENSAJE_BD_CAIDA, "code": "db"}
         except Exception:  # nunca dejar que una excepción rompa el puente ni exponer trazas
             log.exception("Error no controlado en %s", nombre)
             return {"ok": False, "data": None, "error": _MENSAJE_INTERNO, "code": "backend_error"}
@@ -221,6 +230,7 @@ class Api:
         self._inicio_sesion = self._ultima_actividad = 0.0
         self._pending = None      # última grabación válida (aún sin guardar/usar)
         self._wiz = None          # estado del asistente de registro / re-entrenamiento / ampliación
+        self._lock_wiz = threading.Lock()
         self._test_audio = None
         db.init_db()
 
@@ -241,7 +251,10 @@ class Api:
         if not self._auth:
             return "Sesión bloqueada: introduce el PIN."
         ahora = time.monotonic()
-        if ahora - self._ultima_actividad > config.SESION_INACTIVIDAD_SEG and not self._rec.active:
+        # Una grabación en curso no cuenta como inactividad, pero solo hasta su tope duro: si la UI
+        # nunca llama a "Detener", la sesión se bloquea igualmente por inactividad.
+        grabando = self._rec.active and time.time() - self._rec.t0 <= config.GRABACION_MAX_SEG
+        if ahora - self._ultima_actividad > config.SESION_INACTIVIDAD_SEG and not grabando:
             self._cerrar_sesion()
             return "La sesión se bloqueó por inactividad: introduce el PIN."
         if ahora - self._inicio_sesion > config.SESION_MAX_SEG:
@@ -295,6 +308,10 @@ class Api:
 
     @_safe
     def record_stop(self):
+        # Sin grabación en curso, stop() devolvería los bloques de la grabación ANTERIOR:
+        # repetir "Detener" permitiría conservar la misma muestra varias veces.
+        if not self._rec.active:
+            raise ApiError("No hay una grabación en curso.", "no_audio")
         audio = self._rec.stop()
         ok, motivo = ap.validar_calidad_muestra(audio)
         self._pending = audio if ok else None
@@ -374,12 +391,19 @@ class Api:
 
     @_safe
     def wizard_finish(self):
-        w = self._wiz
-        if not w or len(w["muestras"]) < w["min"]:
-            raise ApiError(f"Faltan muestras: el mínimo es {w['min'] if w else config.MIN_MUESTRAS_POR_PERSONA}.", "incomplete")
-        n = registro.guardar_perfil(w["nombre"], w["muestras"], w["modo"])
-        self._wiz = None
-        return {"nombre": w["nombre"], "guardadas": n}
+        # Un doble clic llega como dos llamadas en hilos distintos: sin este candado, en
+        # "ampliar" las mismas muestras se guardaban dos veces.
+        if not self._lock_wiz.acquire(blocking=False):
+            raise ApiError("Ya se está guardando este registro.", "busy")
+        try:
+            w = self._wiz
+            if not w or len(w["muestras"]) < w["min"]:
+                raise ApiError(f"Faltan muestras: el mínimo es {w['min'] if w else config.MIN_MUESTRAS_POR_PERSONA}.", "incomplete")
+            n = registro.guardar_perfil(w["nombre"], w["muestras"], w["modo"])
+            self._wiz = None
+            return {"nombre": w["nombre"], "guardadas": n}
+        finally:
+            self._lock_wiz.release()
 
     @_safe
     def wizard_cancel(self):
@@ -391,6 +415,9 @@ class Api:
     def identify_info(self):
         todos = db.obtener_embeddings_todos()
         compat, desact = matching.filtrar_perfiles_compatibles(todos)
+        if not todos and db.contar_speakers():
+            raise ApiError("Hay personas registradas, pero sus datos no se pudieron descifrar: "
+                           "revisa que VOICE_ID_FERNET_KEY en .env sea la clave original.", "key")
         if not todos:
             raise ApiError("No hay personas registradas todavía.", "empty")
         if not compat:
@@ -413,6 +440,9 @@ class Api:
             "identificado": r.identificado, "nombre": r.nombre, "similitud": r.similitud,
             "distancia": r.distancia if math.isfinite(r.distancia) else None,
             "umbral_sim": config.UMBRAL_SIMILITUD,
+            "segundo": r.segundo,
+            "margen": r.margen if r.margen is not None and math.isfinite(r.margen) else None,
+            "margen_min": config.MARGEN_DISTANCIA,
             "vivacidad_baja": viv is not None and viv < config.VIVACIDAD_UMBRAL, "desactualizados": desact,
         }
 
@@ -424,6 +454,8 @@ class Api:
 
     @_safe
     def analysis_stop(self):
+        if not self._rec.active:
+            raise ApiError("No hay un análisis en curso.", "no_audio")
         self._rec.stop()
         return self._rec.summary()
 
@@ -471,3 +503,38 @@ class Api:
         if self._window is not None:
             threading.Timer(0.2, self._window.destroy).start()
         return True
+
+
+# ---------- exposición a JavaScript ----------
+METODOS_PUBLICOS = tuple(sorted(n for n in dir(Api) if not n.startswith("_") and callable(getattr(Api, n))))
+
+
+class FachadaJS:
+    """
+    Objeto que se pasa a pywebview como js_api: no expone NINGÚN atributo (ni
+    siquiera __class__ o __setattr__), así que el getattr encadenado del
+    despachador de pywebview siempre obtiene None y no ejecuta nada.
+    """
+    __slots__ = ()
+
+    def __getattribute__(self, nombre):
+        raise AttributeError(nombre)
+
+    def __dir__(self):
+        return []
+
+
+def funciones_js(api: Api) -> list:
+    """
+    Funciones sueltas (una por método público de Api) para window.expose. Cada
+    una solo reenvía los argumentos al método decorado con @_safe, que sigue
+    aplicando sesión, límites y validación.
+    """
+    def _expuesta(nombre):
+        metodo = getattr(api, nombre)
+
+        def llamar(*args):
+            return metodo(*args)
+        llamar.__name__ = llamar.__qualname__ = nombre
+        return llamar
+    return [_expuesta(n) for n in METODOS_PUBLICOS]

@@ -169,7 +169,11 @@ def identificar_persona() -> None:
     perfiles_todos = db.obtener_embeddings_todos()
 
     if not perfiles_todos:
-        print("  No hay personas registradas todavía. Usa la opción 1 primero.")
+        if db.contar_speakers():
+            print("  Hay personas registradas, pero sus datos no se pudieron descifrar: "
+                  "revisa que VOICE_ID_FERNET_KEY en .env sea la clave original.")
+        else:
+            print("  No hay personas registradas todavía. Usa la opción 1 primero.")
         return
 
     # Solo se comparan embeddings generados con la versión Y dimensión
@@ -205,15 +209,19 @@ def identificar_persona() -> None:
 
     embedding_nuevo = ap.extraer_embedding(audio)
 
-    # --- Decide la similitud coseno (config.UMBRAL_SIMILITUD); la distancia es solo informativa ---
-    # (lógica de decisión centralizada en matching.py, reutilizable por la
-    # futura API/GUI sin duplicar código ni riesgo de reintroducir el bug)
+    # --- Promedio de las 4 muestras más parecidas + umbral + margen frente al 2º (matching.py) ---
+    # (lógica de decisión centralizada en matching.py, compartida con la GUI)
     resultado = matching.identificar_mejor_candidato(embedding_nuevo, perfiles)
 
     print(
-        f"\nMejor candidato: '{resultado.nombre}'  |  similitud coseno: {resultado.similitud:.4f}  "
-        f"|  distancia euclidiana: {resultado.distancia:.4f}"
+        f"\nMejor candidato: '{resultado.nombre}'  |  similitud coseno (media top-{config.MUESTRAS_COMPARADAS}): "
+        f"{resultado.similitud:.4f}  |  distancia euclidiana media: {resultado.distancia:.4f}"
     )
+    if resultado.margen is not None:
+        print(
+            f"Segundo candidato: '{resultado.segundo}'  |  margen: x{resultado.margen:.2f} "
+            f"(mínimo x{config.MARGEN_DISTANCIA:.2f})"
+        )
 
     if resultado.identificado:
         print(f" IDENTIFICADO como: {resultado.nombre} (confianza {resultado.similitud:.1%})")
@@ -616,20 +624,37 @@ def menu() -> None:
             print(" Opción no válida, intenta de nuevo.")
 
 
+def configurar_consola() -> None:
+    """
+    Si la salida no admite UTF-8 (redirigida a un archivo o consola antigua cp1252),
+    los emojis y símbolos como «≈» se sustituyen en vez de tumbar el programa
+    con UnicodeEncodeError.
+    """
+    for flujo in (sys.stdout, sys.stderr):
+        try:
+            flujo.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def _arrancar() -> None:
+    configurar_consola()
     security.configurar_logs()
     try:
+        security.verificar_clave_cifrado()
+        ap.verificar_motor()
         db.init_db()
-    except db.BaseDatosError as e:
+    except (db.BaseDatosError, RuntimeError) as e:
         print(f" {e}")
         sys.exit(1)
-    if not security.pedir_acceso():
-        sys.exit(1)
-    print("⚙️  Preparando el motor de voz (una sola vez, esto puede tardar unos segundos)...")
-    ap.precalentar_motor()
     try:
+        # Ctrl+C o fin de entrada (Ctrl+Z) en el PIN o en cualquier menú: salida limpia, sin traza.
+        if not security.pedir_acceso():
+            sys.exit(1)
+        print("⚙️  Preparando el motor de voz (una sola vez, esto puede tardar unos segundos)...")
+        ap.precalentar_motor()
         menu()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\nHasta luego ")
     except db.BaseDatosError as e:
         print(f" {e}")

@@ -81,11 +81,15 @@ def main() -> None:
         f"VOICE_ID_PIN_ITER={iteraciones}",
         f"VOICE_ID_FERNET_KEY={clave_fernet}",
     ] + [f"{k}={v}" for k, v in anteriores.items() if k.startswith("VOICE_ID_MONGODB_")]
-    ENV_PATH.write_text("\n".join(lineas) + "\n", encoding="utf-8")
-    try:
-        os.chmod(ENV_PATH, 0o600)  # solo el dueño puede leerlo (efecto completo en Linux/macOS)
-    except OSError:
-        pass
+    # Se escribe en un temporal creado YA con permisos 600 (nunca existe una copia legible por
+    # otros usuarios, ni siquiera un instante) y luego se reemplaza el .env de forma atómica.
+    # En Windows los permisos los dan las ACL de la carpeta del usuario (ya privadas).
+    temporal = ENV_PATH.with_name(".env.tmp")
+    temporal.unlink(missing_ok=True)
+    fd = os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lineas) + "\n")
+    os.replace(temporal, ENV_PATH)
 
     print(f"\n✅ Configuración guardada en: {ENV_PATH}")
     print("   Este archivo está en .gitignore — NUNCA debe subirse a GitHub.")

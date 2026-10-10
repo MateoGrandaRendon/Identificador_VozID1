@@ -24,8 +24,9 @@ import webview
 
 import audio_processor as ap
 import database as db
+import main as cli
 import security
-from frontend.bridge import Api
+from frontend.bridge import Api, FachadaJS, funciones_js
 
 log = logging.getLogger("voiceid.app")
 
@@ -73,11 +74,14 @@ def _construir_html() -> str:
 
 
 def main() -> None:
+    cli.configurar_consola()
     security.configurar_logs()
     _verificar_frontend()
     try:
+        security.verificar_clave_cifrado()
+        ap.verificar_motor()
         api = Api()
-    except db.BaseDatosError as e:
+    except (db.BaseDatosError, RuntimeError) as e:
         print(f"❌ {e}")
         sys.exit(1)
 
@@ -87,8 +91,10 @@ def main() -> None:
 
     ventana = webview.create_window(
         "VoiceID · Identificación biométrica por voz", html=_construir_html(),
-        js_api=api, width=1280, height=820, min_size=(900, 620), background_color="#070b14",
+        js_api=FachadaJS(), width=1280, height=820, min_size=(900, 620), background_color="#070b14",
     )
+    # Solo los métodos públicos, por nombre exacto (ver la nota de seguridad en bridge.py).
+    ventana.expose(*funciones_js(api))
     api._set_window(ventana)
 
     def _proteger_navegacion():

@@ -225,6 +225,21 @@ def _obtener_fernet() -> Fernet:
     return Fernet(config.FERNET_KEY.encode())
 
 
+def verificar_clave_cifrado() -> None:
+    """
+    Se llama al arrancar: una clave ausente o mal copiada en el .env se detecta
+    aquí con un mensaje claro, en vez de que todos los embeddings se omitan en
+    silencio («no hay personas registradas») o falle el primer registro.
+    """
+    try:
+        _obtener_fernet()
+    except ValueError:
+        raise RuntimeError(
+            "VOICE_ID_FERNET_KEY en .env no es una clave válida (¿se copió incompleta?). "
+            "Restaura la clave original: si generas otra, los datos ya cifrados quedarán ilegibles."
+        ) from None
+
+
 def encriptar_bytes(datos: bytes) -> bytes:
     """Encripta bytes (AES-128 autenticado vía Fernet)."""
     return _obtener_fernet().encrypt(datos)

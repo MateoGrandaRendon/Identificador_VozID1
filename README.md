@@ -19,6 +19,8 @@ voice_identifier/
 ├── audio_processor.py       # Captura de audio, extracción de embeddings, comparación
 ├── matching.py              # Lógica de decisión de identificación
 ├── setup_seguridad.py       # Genera PIN y clave de cifrado en .env
+├── calibrar_umbral.py       # Mide la identificación con las personas registradas
+├── recalcular_embeddings.py # Recalcula los embeddings al cambiar de motor de voz
 ├── migrar_sqlite_a_mongo.py # Migración única desde la versión SQLite anterior
 ├── requirements.txt         # Dependencias (versiones fijadas y auditadas)
 ├── requirements-dev.txt     # + pytest, mongomock, pip-audit
@@ -38,6 +40,7 @@ tiene versión para 3.13):
 py -3.12 -m venv .venv312
 .venv312\Scripts\Activate.ps1
 pip install -r requirements.txt
+python -m motor_ecapa        # descarga única del modelo de voz (~80 MB)
 python setup_seguridad.py
 ```
 
@@ -46,6 +49,7 @@ python setup_seguridad.py
 python3.12 -m venv .venv312
 source .venv312/bin/activate
 pip install -r requirements.txt
+python -m motor_ecapa        # descarga única del modelo de voz (~80 MB)
 python setup_seguridad.py
 ```
 
@@ -71,6 +75,18 @@ La aplicación necesita un servidor MongoDB:
 - **Docker**: `docker run -d --name voiceid-mongo -p 127.0.0.1:27017:27017 mongo:7`
 - **Remoto (Atlas)**: pon la URI en `.env` como `VOICE_ID_MONGODB_URI=mongodb+srv://...`.
   Una conexión remota sin TLS se rechaza.
+
+> **Si el equipo tiene más de una cuenta de Windows (o lo usan otras personas), activa la
+> autenticación de MongoDB.** Sin ella, cualquier cuenta o programa del equipo puede
+> conectarse a `127.0.0.1:27017` y ver los nombres de las personas registradas, o borrar
+> o renombrar sus perfiles (los embeddings siguen cifrados). Pasos:
+> 1. Con `mongosh`, crea un usuario solo para la app:
+>    `use voice_id` y luego
+>    `db.createUser({user: "voiceid", pwd: passwordPrompt(), roles: ["readWrite", "dbAdmin"]})`.
+> 2. En `mongod.cfg` (p. ej. `C:\Program Files\MongoDB\Server\<versión>\bin\mongod.cfg`) añade
+>    `security:` / `  authorization: enabled` y reinicia el servicio *MongoDB*.
+>    En Docker: crea el contenedor con `-e MONGO_INITDB_ROOT_USERNAME=... -e MONGO_INITDB_ROOT_PASSWORD=...`.
+> 3. En `.env`: `VOICE_ID_MONGODB_URI=mongodb://voiceid:CLAVE@127.0.0.1:27017/voice_id`.
 
 La configuración va en `.env` (ver `.env.example`); nunca en el código.
 
@@ -103,7 +119,7 @@ Colección `speakers`, un documento por persona con sus muestras embebidas
   "nombre": "Ana María", "nombre_clave": "ana maría", "fecha_registro": "ISODate",
   "muestras": [
     {"archivo_audio": "<uuid>.wav.enc", "embedding": "BinData (cifrado)",
-     "version_embedding": 2, "dim": 156, "fecha_creacion": "ISODate"}
+     "version_embedding": 3, "dim": 192, "fecha_creacion": "ISODate"}
   ]
 }
 ```
@@ -120,7 +136,7 @@ Colección `estado_seguridad`: contador de intentos fallidos de PIN y bloqueo.
 | 4 | CSRF | No hay servidor HTTP ni cookies; la API solo existe dentro de la ventana. `form-action 'none'`. |
 | 5 | SSRF | La app no hace peticiones a URLs; la URI de MongoDB solo viene del `.env`. `connect-src 'none'`. |
 | 6 | Fallos de autenticación | PIN con PBKDF2-SHA256 (600 000 iteraciones), comparación en tiempo constante, PIN mínimo de 6 caracteres no trivial. |
-| 7, 8 | Autorización / escalada | Denegar por defecto: todo método exige sesión salvo 3 de solo lectura; los métodos internos son privados (`_`); los nombres que empiezan por `_` están reservados. |
+| 7, 8 | Autorización / escalada | Denegar por defecto: todo método exige sesión salvo 3 de solo lectura. A pywebview se le entrega una fachada vacía y solo los métodos públicos se registran por nombre exacto (`window.expose`), porque su despachador alcanza cualquier atributo, incluso privados (`_`) y `__setattr__`. Los nombres que empiezan por `_` están reservados (también en la migración). |
 | 9, 21 | Exposición de información / trazas | Al usuario solo se muestran mensajes genéricos; los detalles van a `data/logs/voiceid.log`, sin nombres ni secretos. |
 | 10 | Credenciales en el código | PIN, clave y URI solo en `.env` (fuera de git, permisos 600). |
 | 11 | Sesiones | Se bloquea tras 10 min de inactividad o 8 h; botón «Bloquear sesión»; al bloquear se borran de memoria los audios pendientes. |
@@ -143,9 +159,24 @@ Auditar dependencias: `pip-audit -r requirements.txt`.
 
 ## 6. Notas técnicas
 
-- **Embedding de voz**: MFCC + deltas, F0, formantes (LPC), energía,
-  contraste espectral, ZCR y ritmo (`audio_processor.extraer_embedding`).
-- **Umbral de decisión**: `UMBRAL_SIMILITUD = 0.995` en `config.py` (similitud
-  coseno). Todos los embeddings tienen la misma norma, así que equivale a una
-  distancia euclidiana ≤ 0,30, que se muestra solo como dato informativo. Con
-  0,90 se aceptaba a personas distintas: si lo ajustas, calíbralo con voces reales.
+- **Embedding de voz** (`config.MOTOR_EMBEDDING`):
+  - `ecapa` (por defecto): modelo preentrenado ECAPA-TDNN de SpeechBrain
+    (`motor_ecapa.py`), 192 dimensiones. Descarga única (~80 MB):
+    `python -m motor_ecapa`. Revisión fijada, SHA-256 verificado y carga con
+    `weights_only=True` (el archivo no puede ejecutar código).
+  - `clasico`: MFCC + deltas, F0, formantes (LPC), energía, contraste, ZCR y
+    ritmo. Con voces reales da 96-99 % entre cualquier par de voces, así que no
+    separa a las personas; queda solo para equipos sin PyTorch
+    (`VOICE_ID_MOTOR=clasico` en `.env`).
+  - Al cambiar de motor, `python recalcular_embeddings.py` recalcula todos los
+    embeddings desde los audios de `data/audio`, sin volver a grabar.
+- **Decisión de identificación** (`matching.py`): cada persona se puntúa con el
+  **promedio de sus 4 muestras más parecidas** (`MUESTRAS_COMPARADAS`), no con
+  una sola muestra suelta. Se acepta si ese promedio alcanza el umbral
+  (ECAPA: `0.40`, medido con voces reales: misma persona 63-77 %, otras
+  personas ≤ 9 %) **y** la segunda persona está al menos
+  `MARGEN_DISTANCIA = 1.1` veces más lejos en distancia euclidiana. Así, una voz
+  que se parece por igual a dos personas no se asigna a ninguna.
+- **Calibración**: `python calibrar_umbral.py` (pide el PIN) evalúa la regla con
+  las personas ya registradas y recomienda umbral y margen. Hacen falta al menos
+  2 personas; el resultado es optimista porque las muestras son de la misma sesión.

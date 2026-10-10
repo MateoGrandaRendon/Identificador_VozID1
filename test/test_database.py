@@ -148,6 +148,19 @@ def test_uri_remota_sin_tls_rechazada():
     db._validar_uri("mongodb://127.0.0.1:27017")
 
 
+@pytest.mark.parametrize("opcion", ["tls=false", "ssl=false", "tls=False", "tls=true&tlsInsecure=true",
+                                    "tlsAllowInvalidCertificates=true"])
+def test_uri_srv_sin_tls_o_sin_verificar_rechazada(opcion):
+    # En mongodb+srv las opciones llegan como texto: "false" no debe contar como TLS activo.
+    with pytest.raises(db.BaseDatosError):
+        db._validar_uri(f"mongodb+srv://usuario:clave@cluster.example.net/?{opcion}")
+
+
+def test_uri_srv_segura_aceptada():
+    db._validar_uri("mongodb+srv://usuario:clave@cluster.example.net/?retryWrites=true")
+    db._validar_uri("mongodb+srv://cluster.example.net/?tls=true&tlsInsecure=false")
+
+
 # ---------------------------------------------------------------------------
 # PIN: fuerza bruta con bloqueo progresivo y persistente
 # ---------------------------------------------------------------------------

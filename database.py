@@ -74,6 +74,9 @@ COLECCION_SEGURIDAD = "estado_seguridad"
 # (uuid4 en hexadecimal). Cualquier otra cosa (p. ej. "../../x") se rechaza.
 _PATRON_ARCHIVO_AUDIO = re.compile(r"^[0-9a-f]{32}\.wav\.enc$")
 _HOSTS_LOCALES = {"localhost", "127.0.0.1", "::1"}
+# casefold() puede alargar un nombre hasta 3 veces ("ß" -> "ss", "ΐ" -> 3 caracteres):
+# la clave admite ese crecimiento para no rechazar un nombre que ya pasó la validación.
+CLAVE_MAX_LARGO = config.NOMBRE_MAX_LARGO * 3
 
 
 class BaseDatosError(Exception):
@@ -91,6 +94,13 @@ _cliente = None
 _lock_cliente = threading.Lock()
 
 
+def _como_bool(valor) -> bool:
+    """Opción booleana de una URI de MongoDB, venga ya convertida (bool) o como texto ("true"/"false")."""
+    if isinstance(valor, str):
+        return valor.strip().lower() == "true"
+    return bool(valor)
+
+
 def _validar_uri(uri: str) -> None:
     """
     Rechaza conexiones inseguras a servidores remotos: si algún host no es
@@ -98,21 +108,23 @@ def _validar_uri(uri: str) -> None:
     mongodb+srv:// activa TLS por defecto en pymongo.
     """
     if uri.startswith("mongodb+srv://"):
+        # validate=False deja las opciones como TEXTO ("false" es verdadero en Python):
+        # por eso todo valor pasa por _como_bool antes de decidir.
         partes = parse_uri(uri.replace("mongodb+srv://", "mongodb://", 1), validate=False)
         opciones = partes["options"]
-        remoto, tls = True, opciones.get("tls", opciones.get("ssl", True))
+        remoto, tls = True, _como_bool(opciones.get("tls", opciones.get("ssl", True)))
     else:
         partes = parse_uri(uri)
         opciones = partes["options"]
         remoto = any(host not in _HOSTS_LOCALES for host, _ in partes["nodelist"])
-        tls = opciones.get("tls", opciones.get("ssl", False))
+        tls = _como_bool(opciones.get("tls", opciones.get("ssl", False)))
 
     if remoto and not tls:
         raise BaseDatosError(
             "La conexión a un MongoDB remoto debe usar TLS. Usa una URI mongodb+srv:// "
             "o añade 'tls=true' a VOICE_ID_MONGODB_URI en el .env."
         )
-    if any(opciones.get(k) for k in ("tlsInsecure", "tlsAllowInvalidCertificates", "tlsAllowInvalidHostnames")):
+    if any(_como_bool(opciones.get(k, False)) for k in ("tlsInsecure", "tlsAllowInvalidCertificates", "tlsAllowInvalidHostnames")):
         raise BaseDatosError("La URI de MongoDB desactiva la verificación de certificados TLS: no está permitido.")
 
 
@@ -151,7 +163,7 @@ _ESQUEMA_SPEAKERS = {
         "required": ["nombre", "nombre_clave", "fecha_registro", "muestras"],
         "properties": {
             "nombre": {"bsonType": "string", "minLength": 1, "maxLength": config.NOMBRE_MAX_LARGO},
-            "nombre_clave": {"bsonType": "string", "minLength": 1, "maxLength": config.NOMBRE_MAX_LARGO},
+            "nombre_clave": {"bsonType": "string", "minLength": 1, "maxLength": CLAVE_MAX_LARGO},
             "fecha_registro": {"bsonType": "date"},
             "muestras": {
                 "bsonType": "array",
@@ -212,7 +224,7 @@ def _clave(nombre: str) -> str:
     if not isinstance(nombre, str):
         raise BaseDatosError("Nombre inválido.")
     clave = nombre.strip().casefold()
-    if not clave or len(clave) > config.NOMBRE_MAX_LARGO:
+    if not clave or len(clave) > CLAVE_MAX_LARGO:
         raise BaseDatosError("Nombre inválido.")
     return clave
 
@@ -381,6 +393,11 @@ def listar_speakers() -> list[dict]:
             "necesita_reentrenar": len(muestras) > 0 and compatibles == 0,
         })
     return resultado
+
+
+def contar_speakers() -> int:
+    """Número de personas registradas (sin descifrar nada)."""
+    return _speakers().count_documents({})
 
 
 def diagnostico_embeddings() -> list[dict]:

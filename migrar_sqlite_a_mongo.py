@@ -57,6 +57,14 @@ def migrar(borrar_sqlite: bool) -> None:
 
     migradas, omitidas, embeddings_viejos = 0, [], []
     for sp in con.execute("SELECT id, nombre, fecha_registro FROM speakers"):
+        # Mismas reglas de nombre que la GUI y el CLI: así ningún nombre migrado puede
+        # chocar con el nombre reservado de las pruebas (main.NOMBRE_PRUEBA, que empieza
+        # por "_" y se borra en cada autoprueba) ni quedar imposible de gestionar.
+        try:
+            nombre = security.validar_nombre_persona(str(sp["nombre"])[: config.NOMBRE_MAX_LARGO])
+        except ValueError:
+            omitidas.append(f"registro #{sp['id']} (nombre no válido: regístralo de nuevo)")
+            continue
         filas = con.execute(
             f"SELECT ruta_audio, ruta_embedding, fecha_creacion, {col_version} "
             "FROM voice_samples WHERE speaker_id = ? ORDER BY fecha_creacion DESC",
@@ -84,17 +92,17 @@ def migrar(borrar_sqlite: bool) -> None:
             })
 
         if len(muestras) < config.MIN_MUESTRAS_POR_PERSONA:
-            omitidas.append(sp["nombre"])
+            omitidas.append(nombre)
             continue
         try:
             db._speakers().insert_one({
-                "nombre": sp["nombre"].strip()[: config.NOMBRE_MAX_LARGO],
-                "nombre_clave": db._clave(sp["nombre"][: config.NOMBRE_MAX_LARGO]),
+                "nombre": nombre,
+                "nombre_clave": db._clave(nombre),
                 "fecha_registro": _fecha(sp["fecha_registro"]),
                 "muestras": list(reversed(muestras)),
             })
         except DuplicateKeyError:
-            omitidas.append(f"{sp['nombre']} (ya existía en MongoDB)")
+            omitidas.append(f"{nombre} (ya existía en MongoDB)")
             continue
         for viejo, nuevo in renombres:
             viejo.rename(nuevo)

@@ -9,7 +9,7 @@ exactamente las mismas reglas:
   - "reentrenar": reemplaza todas las muestras, entre MIN y MAX.
   - "ampliar":    añade muestras sin pasar del MAX en total.
 
-Primero se escriben los audios cifrados y se extraen los embeddings; luego
+Primero se extraen los embeddings y se escriben los audios cifrados; luego
 se hace UNA escritura atómica en MongoDB. Si algo falla, se borran los
 audios recién creados para no dejar archivos huérfanos.
 """
@@ -42,9 +42,10 @@ def guardar_perfil(nombre: str, audios, modo: str) -> int:
     try:
         muestras = []
         for audio in audios:
+            embedding = ap.extraer_embedding(audio)   # antes de escribir: si falla, no queda ningún archivo
             ruta = ap.guardar_wav(audio)
             rutas.append(ruta)
-            muestras.append((ruta, ap.extraer_embedding(audio)))
+            muestras.append((ruta, embedding))
 
         if modo == "registro":
             if db.registrar_speaker(nombre, muestras) == "duplicado":

@@ -111,9 +111,10 @@ async function idStop(){if(!rec.on)return;liveStop();en("#id-stop",false);idStat
   const r=await call("record_stop");if(!r.ok||!r.data.valida){en("#id-start",true);idStatus(r.ok?`No se pudo analizar: ${r.data.motivo}`:r.error,"err");
     if(r.ok)$("#id-result").innerHTML=`<h3>Resultado de identificación</h3><p class="fail">No se reconoce ninguna voz registrada</p>`;return}
   const q=await call("identify_run");en("#id-start",true);if(!q.ok)return idStatus(q.error,"err");idStatus("");const d=q.data;
+  const margen=d.segundo==null?"":` · margen ×${d.margen==null?"∞":d.margen.toFixed(2)} frente a ${esc(d.segundo)} (mín. ×${d.margen_min.toFixed(2)})`;
   $("#id-result").innerHTML=d.identificado
-    ?`<h3>Resultado de identificación</h3><p>Persona identificada:</p><div class="big">${esc(d.nombre)}</div><p>Confianza: <b class="ok-c">${(d.similitud*100).toFixed(1)}%</b> · distancia ${d.distancia.toFixed(3)}</p>${d.vivacidad_baja?`<p class="warn-c">⚠ Vivacidad baja: heurística informativa, verifica en persona.</p>`:""}`
-    :`<h3>Resultado de identificación</h3><p class="fail"><b>No se reconoce ninguna voz registrada</b></p><p class="muted">Mejor candidato (no aceptado): ${esc(d.nombre)} · similitud ${(d.similitud*100).toFixed(1)}% (umbral ${(d.umbral_sim*100).toFixed(1)}%) · distancia ${d.distancia==null?"—":d.distancia.toFixed(3)}</p>`}
+    ?`<h3>Resultado de identificación</h3><p>Persona identificada:</p><div class="big">${esc(d.nombre)}</div><p>Confianza: <b class="ok-c">${(d.similitud*100).toFixed(1)}%</b> · distancia ${d.distancia.toFixed(3)}${margen}</p>${d.vivacidad_baja?`<p class="warn-c">⚠ Vivacidad baja: heurística informativa, verifica en persona.</p>`:""}`
+    :`<h3>Resultado de identificación</h3><p class="fail"><b>No se reconoce ninguna voz registrada</b></p><p class="muted">Mejor candidato (no aceptado): ${esc(d.nombre)} · similitud ${(d.similitud*100).toFixed(1)}% (umbral ${(d.umbral_sim*100).toFixed(1)}%) · distancia ${d.distancia==null?"—":d.distancia.toFixed(3)}${margen}</p>`}
 $("#id-stop").onclick=idStop;
 
 /* ---------- personas: eliminar / gestionar ---------- */
